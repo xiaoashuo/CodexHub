@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex\u4f34\u4fa3",
+  "version": "0.1.1",
+  "identifier": "com.codex.router.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --port 5173 --strictPort",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Codex\u4f34\u4fa3",
+        "width": 1280,
+        "height": 820,
+        "decorations": false,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "copyright": "Copyright \u00a9 2026 yakir All Rights Reserved",
+    "useLocalToolsDir": true,
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "targets": ["msi"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "skip"
+      },
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
+  }
+}

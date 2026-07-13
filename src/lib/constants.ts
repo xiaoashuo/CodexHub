@@ -1,0 +1,10 @@
+export const APP_VERSION = '0.1.1';
+export const ROUTER_HOST = '127.0.0.1';
+export const ROUTER_PORT = 25817;
+export const ROUTER_BASE_PATH = '/codex/router/v1';
+export const ROUTER_HEALTH_PATH = '/health';
+export const ROUTER_HEALTH_URL = `http://${ROUTER_HOST}:${ROUTER_PORT}${ROUTER_HEALTH_PATH}`;
+export const DEFAULT_PROVIDER_NAME = 'AI智能路由';
+export const DEFAULT_MODEL_SLUG = 'default_model';
+export const CODEX_CONFIG_PATH = '%USERPROFILE%\\.codex\\config.toml';
+export const ROUTER_MAPPING_PATH = '%USERPROFILE%\\.codex\\ai-router-workspace\\config\\router_provider_config.json';
