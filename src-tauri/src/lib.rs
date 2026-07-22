@@ -6256,6 +6256,7 @@ fn stream_custom_responses_request(
     mut payload: serde_json::Value,
     route: ProviderRoute,
 ) -> std::io::Result<RouterLogEntry> {
+    guard_wait_tool_for_upstream(&mut payload);
     let protocol_type = normalize_protocol_type(&route.protocol_type);
     let use_codex_chat_tool_bridge =
         protocol_type == "cpamc" && request_has_codex_custom_tools(&payload);
@@ -6536,6 +6537,7 @@ fn stream_custom_responses_request(
                 let uses_image_generation_tool = request_uses_image_generation_tool(&payload);
                 let available_tool_names = collect_available_tool_names(&payload);
                 let custom_tool_names = collect_custom_tool_names(&payload);
+                let namespace_tool_mappings = collect_namespace_tool_mappings(&payload);
                 if let Err(error) = stream_openai_chat_sse_as_codex(
                     response,
                     stream,
@@ -6543,6 +6545,7 @@ fn stream_custom_responses_request(
                     uses_image_generation_tool,
                     &available_tool_names,
                     &custom_tool_names,
+                    &namespace_tool_mappings,
                     Some(&full_debug_id),
                 ) {
                     error_detail = format!("upstream stream disconnected: {}", error);
@@ -9146,6 +9149,7 @@ fn forward_custom_responses_request(
     mut payload: serde_json::Value,
     requested_model: &str,
 ) -> RouterResponse {
+    guard_wait_tool_for_upstream(&mut payload);
     let config = match load_provider_config() {
         Ok(config) => config,
         Err(error) => {
@@ -9632,6 +9636,8 @@ fn remove_json_key_recursive(value: &mut serde_json::Value, key: &str) {
 
 fn build_openai_chat_body(payload: &serde_json::Value, route: &ProviderRoute) -> serde_json::Value {
     let mut body = serde_json::Map::new();
+    let active_exec_cell_ids = collect_active_exec_cell_ids(payload);
+    let uses_codex_custom_tool_bridge = request_has_codex_custom_tools(payload);
     body.insert(
         "model".to_string(),
         serde_json::Value::String(route.real_model.clone()),
@@ -9642,10 +9648,18 @@ fn build_openai_chat_body(payload: &serde_json::Value, route: &ProviderRoute) ->
     );
     body.insert("stream".to_string(), serde_json::Value::Bool(false));
 
-    if let Some(tools) = payload
+    if let Some(mut tools) = payload
         .get("tools")
         .and_then(convert_responses_tools_to_chat_tools)
     {
+        tools.retain(|tool| {
+            chat_function_tool_name(tool) != Some("wait") || !active_exec_cell_ids.is_empty()
+        });
+        for tool in &mut tools {
+            if chat_function_tool_name(tool) == Some("wait") {
+                constrain_chat_wait_tool(tool, &active_exec_cell_ids);
+            }
+        }
         body.insert("tools".to_string(), serde_json::Value::Array(tools));
     }
 
@@ -9656,7 +9670,12 @@ fn build_openai_chat_body(payload: &serde_json::Value, route: &ProviderRoute) ->
         );
     }
 
-    if let Some(parallel_tool_calls) = payload.get("parallel_tool_calls").cloned() {
+    if uses_codex_custom_tool_bridge {
+        body.insert(
+            "parallel_tool_calls".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    } else if let Some(parallel_tool_calls) = payload.get("parallel_tool_calls").cloned() {
         body.insert("parallel_tool_calls".to_string(), parallel_tool_calls);
     }
 
@@ -9669,6 +9688,293 @@ fn build_openai_chat_body(payload: &serde_json::Value, route: &ProviderRoute) ->
     }
 
     serde_json::Value::Object(body)
+}
+
+fn chat_function_tool_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(|name| name.as_str())
+}
+
+fn constrain_chat_wait_tool(tool: &mut serde_json::Value, active_cell_ids: &[String]) {
+    let Some(function) = tool
+        .get_mut("function")
+        .and_then(|function| function.as_object_mut())
+    else {
+        return;
+    };
+
+    function.insert(
+        "description".to_string(),
+        serde_json::Value::String(format!(
+            "Wait only for an exec cell that is currently running. Valid cell_id values: {}. Never invent a cell ID and never use noop.",
+            active_cell_ids.join(", ")
+        )),
+    );
+    let parameters = function
+        .entry("parameters".to_string())
+        .or_insert_with(|| serde_json::json!({ "type": "object", "properties": {} }));
+    if !parameters.is_object() {
+        *parameters = serde_json::json!({ "type": "object", "properties": {} });
+    }
+    let parameters = parameters.as_object_mut().expect("wait parameters object");
+    parameters.insert(
+        "type".to_string(),
+        serde_json::Value::String("object".to_string()),
+    );
+    let properties = parameters
+        .entry("properties".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !properties.is_object() {
+        *properties = serde_json::json!({});
+    }
+    let properties = properties.as_object_mut().expect("wait properties object");
+    let cell_id = properties
+        .entry("cell_id".to_string())
+        .or_insert_with(|| serde_json::json!({ "type": "string" }));
+    if !cell_id.is_object() {
+        *cell_id = serde_json::json!({ "type": "string" });
+    }
+    let cell_id = cell_id.as_object_mut().expect("wait cell_id object");
+    cell_id.insert(
+        "type".to_string(),
+        serde_json::Value::String("string".to_string()),
+    );
+    cell_id.insert(
+        "enum".to_string(),
+        serde_json::Value::Array(
+            active_cell_ids
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+}
+
+fn collect_active_exec_cell_ids(payload: &serde_json::Value) -> Vec<String> {
+    let Some(items) = payload
+        .get(OFFICIAL_INPUT_KEY)
+        .and_then(|input| input.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut active = HashSet::<String>::new();
+    let mut calls = HashMap::<String, (String, Option<String>)>::new();
+
+    for item in items {
+        let item_type = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        match item_type {
+            "function_call" | "custom_tool_call" => {
+                let Some(call_id) = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let cell_id = item
+                    .get("arguments")
+                    .and_then(|arguments| arguments.as_str())
+                    .and_then(wait_cell_id_from_arguments);
+                calls.insert(call_id.to_string(), (name, cell_id));
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                let output = item.get("output").map(content_to_text).unwrap_or_default();
+                if let Some(call_id) = item.get("call_id").and_then(|value| value.as_str()) {
+                    if let Some((name, Some(cell_id))) = calls.get(call_id) {
+                        if name == "wait" && extract_running_exec_cell_ids(&output).is_empty() {
+                            active.remove(cell_id);
+                        }
+                    }
+                }
+                active.extend(extract_running_exec_cell_ids(&output));
+            }
+            _ => {}
+        }
+    }
+
+    let mut active = active.into_iter().collect::<Vec<_>>();
+    active.sort();
+    active
+}
+
+fn wait_cell_id_from_arguments(arguments: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|arguments| arguments.get("cell_id").cloned())
+        .and_then(|cell_id| cell_id.as_str().map(str::to_string))
+        .filter(|cell_id| !cell_id.trim().is_empty())
+}
+
+fn extract_running_exec_cell_ids(output: &str) -> Vec<String> {
+    const MARKER: &str = "Script running with cell ID ";
+    let mut ids = Vec::new();
+    let mut remaining = output;
+    while let Some(index) = remaining.find(MARKER) {
+        let after_marker = &remaining[index + MARKER.len()..];
+        let id = after_marker
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '`' | '\'' | '"' | ',' | '.' | ';' | ':' | ')' | ']'
+                )
+            });
+        if !id.is_empty() && id != "noop" {
+            ids.push(id.to_string());
+        }
+        remaining = after_marker;
+    }
+    ids
+}
+
+fn guard_wait_tool_for_upstream(payload: &mut serde_json::Value) {
+    let active_cell_ids = collect_active_exec_cell_ids(payload);
+    let mut saw_wait_tool = false;
+    if let Some(tools) = payload
+        .get_mut("tools")
+        .and_then(|tools| tools.as_array_mut())
+    {
+        tools.retain_mut(|tool| {
+            let tool_type = tool
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if tool_type == "namespace" {
+                let namespace = tool
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(children) = tool.get_mut("tools").and_then(|tools| tools.as_array_mut())
+                {
+                    children.retain_mut(|child| {
+                        let is_wait = child.get("name").and_then(|value| value.as_str())
+                            == Some("wait")
+                            || (namespace == "wait"
+                                && child.get("type").and_then(|value| value.as_str())
+                                    == Some("function"));
+                        if !is_wait {
+                            return true;
+                        }
+                        saw_wait_tool = true;
+                        if active_cell_ids.is_empty() {
+                            return false;
+                        }
+                        constrain_responses_wait_tool(child, &active_cell_ids);
+                        true
+                    });
+                    return !children.is_empty();
+                }
+                return true;
+            }
+
+            let is_wait = tool.get("name").and_then(|value| value.as_str()) == Some("wait");
+            if !is_wait {
+                return true;
+            }
+            saw_wait_tool = true;
+            if active_cell_ids.is_empty() {
+                return false;
+            }
+            constrain_responses_wait_tool(tool, &active_cell_ids);
+            true
+        });
+    }
+
+    if saw_wait_tool {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "parallel_tool_calls".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            if active_cell_ids.is_empty()
+                && object
+                    .get("tool_choice")
+                    .is_some_and(tool_choice_targets_wait)
+            {
+                object.insert(
+                    "tool_choice".to_string(),
+                    serde_json::Value::String("auto".to_string()),
+                );
+            }
+        }
+    }
+}
+
+fn tool_choice_targets_wait(tool_choice: &serde_json::Value) -> bool {
+    match tool_choice {
+        serde_json::Value::Object(object) => {
+            object.get("name").and_then(|value| value.as_str()) == Some("wait")
+                || object.get("namespace").and_then(|value| value.as_str()) == Some("wait")
+                || object.values().any(tool_choice_targets_wait)
+        }
+        serde_json::Value::Array(items) => items.iter().any(tool_choice_targets_wait),
+        _ => false,
+    }
+}
+
+fn constrain_responses_wait_tool(tool: &mut serde_json::Value, active_cell_ids: &[String]) {
+    let Some(object) = tool.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "description".to_string(),
+        serde_json::Value::String(format!(
+            "Wait only for a currently running exec cell. Valid cell_id values: {}. Never invent a cell ID and never use noop.",
+            active_cell_ids.join(", ")
+        )),
+    );
+    let parameters = object
+        .entry("parameters".to_string())
+        .or_insert_with(|| serde_json::json!({ "type": "object", "properties": {} }));
+    if !parameters.is_object() {
+        *parameters = serde_json::json!({ "type": "object", "properties": {} });
+    }
+    let parameters = parameters.as_object_mut().expect("wait parameters object");
+    parameters.insert(
+        "type".to_string(),
+        serde_json::Value::String("object".to_string()),
+    );
+    let properties = parameters
+        .entry("properties".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !properties.is_object() {
+        *properties = serde_json::json!({});
+    }
+    let properties = properties.as_object_mut().expect("wait properties object");
+    let cell_id = properties
+        .entry("cell_id".to_string())
+        .or_insert_with(|| serde_json::json!({ "type": "string" }));
+    if !cell_id.is_object() {
+        *cell_id = serde_json::json!({ "type": "string" });
+    }
+    let cell_id = cell_id.as_object_mut().expect("wait cell_id object");
+    cell_id.insert(
+        "type".to_string(),
+        serde_json::Value::String("string".to_string()),
+    );
+    cell_id.insert(
+        "enum".to_string(),
+        serde_json::Value::Array(
+            active_cell_ids
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
 }
 
 fn build_anthropic_messages_body(
@@ -9728,6 +10034,7 @@ fn extract_chat_messages(payload: &serde_json::Value, omit_system: bool) -> Vec<
     match payload.get(OFFICIAL_INPUT_KEY) {
         Some(serde_json::Value::Array(items)) => {
             let mut pending_function_calls: Vec<serde_json::Value> = Vec::new();
+            let mut seen_tool_call_ids = HashSet::<String>::new();
 
             for item in items {
                 let item_type = item
@@ -9736,6 +10043,13 @@ fn extract_chat_messages(payload: &serde_json::Value, omit_system: bool) -> Vec<
                     .unwrap_or_default();
 
                 if item_type == "function_call" || item_type == "custom_tool_call" {
+                    if let Some(call_id) = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|value| value.as_str())
+                    {
+                        seen_tool_call_ids.insert(call_id.to_string());
+                    }
                     pending_function_calls.push(item.clone());
                 } else {
                     if !pending_function_calls.is_empty() {
@@ -9745,6 +10059,27 @@ fn extract_chat_messages(payload: &serde_json::Value, omit_system: bool) -> Vec<
                             messages.push(merged);
                         }
                         pending_function_calls.clear();
+                    }
+                    if matches!(
+                        item_type,
+                        "function_call_output" | "custom_tool_call_output"
+                    ) {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        if !call_id.is_empty() && !seen_tool_call_ids.contains(call_id) {
+                            let output =
+                                item.get("output").map(content_to_text).unwrap_or_default();
+                            messages.push(json_chat_message(
+                                "user",
+                                &format!(
+                                    "Tool output for unavailable call {}: {}",
+                                    call_id, output
+                                ),
+                            ));
+                            continue;
+                        }
                     }
                     if let Some(message) = normalize_chat_message(item, omit_system) {
                         messages.push(message);
@@ -9835,13 +10170,127 @@ fn convert_responses_tools_to_chat_tools(
     let tools = value.as_array()?;
     let converted = tools
         .iter()
-        .filter_map(convert_responses_tool_to_chat_tool)
+        .flat_map(|tool| {
+            if tool.get("type").and_then(|value| value.as_str()) == Some("namespace") {
+                convert_responses_namespace_tool_to_chat_tools(tool)
+            } else {
+                convert_responses_tool_to_chat_tool(tool)
+                    .into_iter()
+                    .collect()
+            }
+        })
         .collect::<Vec<_>>();
     if converted.is_empty() {
         None
     } else {
         Some(converted)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NamespaceToolMapping {
+    flattened_name: String,
+    namespace: String,
+    name: String,
+}
+
+fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        return name.to_string();
+    }
+    if name.is_empty() {
+        return namespace.to_string();
+    }
+    if namespace.ends_with("__") || name.starts_with("__") {
+        format!("{}{}", namespace, name)
+    } else {
+        format!("{}__{}", namespace, name)
+    }
+}
+
+fn collect_namespace_tool_mappings(payload: &serde_json::Value) -> Vec<NamespaceToolMapping> {
+    let Some(tools) = payload.get("tools").and_then(|tools| tools.as_array()) else {
+        return Vec::new();
+    };
+    let mut mappings = Vec::new();
+    for tool in tools {
+        if tool.get("type").and_then(|value| value.as_str()) != Some("namespace") {
+            continue;
+        }
+        let namespace = tool
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let Some(children) = tool.get("tools").and_then(|tools| tools.as_array()) else {
+            continue;
+        };
+        for child in children {
+            let Some(name) = child.get("name").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            mappings.push(NamespaceToolMapping {
+                flattened_name: flatten_namespace_tool_name(namespace, name),
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+            });
+        }
+    }
+    mappings
+}
+
+fn convert_responses_namespace_tool_to_chat_tools(
+    tool: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let namespace = tool
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let namespace_description = tool
+        .get("description")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let Some(children) = tool.get("tools").and_then(|tools| tools.as_array()) else {
+        return Vec::new();
+    };
+    children
+        .iter()
+        .filter(|child| child.get("type").and_then(|value| value.as_str()) == Some("function"))
+        .filter_map(|child| {
+            let name = child.get("name")?.as_str()?;
+            let child_description = child
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let description = [namespace_description, child_description]
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let mut function = serde_json::Map::new();
+            function.insert(
+                "name".to_string(),
+                serde_json::Value::String(flatten_namespace_tool_name(namespace, name)),
+            );
+            if !description.is_empty() {
+                function.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description),
+                );
+            }
+            function.insert(
+                "parameters".to_string(),
+                child
+                    .get("parameters")
+                    .cloned()
+                    .filter(|parameters| parameters.is_object())
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} })),
+            );
+            Some(serde_json::json!({
+                "type": "function",
+                "function": serde_json::Value::Object(function)
+            }))
+        })
+        .collect()
 }
 
 fn convert_responses_tool_to_chat_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
@@ -10505,12 +10954,14 @@ fn wrap_chat_response_as_responses(
 ) -> String {
     let available_tool_names = collect_available_tool_names(original_payload);
     let custom_tool_names = collect_custom_tool_names(original_payload);
+    let namespace_tool_mappings = collect_namespace_tool_mappings(original_payload);
     if protocol_type != "anthropic" {
         if let Some(sse_body) = openai_chat_sse_body_to_codex_sse(
             body,
             route,
             &available_tool_names,
             &custom_tool_names,
+            &namespace_tool_mappings,
         ) {
             return sse_body;
         }
@@ -10526,6 +10977,7 @@ fn wrap_chat_response_as_responses(
             root.get("usage"),
             &available_tool_names,
             &custom_tool_names,
+            &namespace_tool_mappings,
         ) {
             return tool_sse;
         }
@@ -10581,6 +11033,7 @@ fn openai_chat_sse_body_to_codex_sse(
     route: &ProviderRoute,
     available_tool_names: &[String],
     custom_tool_names: &[String],
+    namespace_tool_mappings: &[NamespaceToolMapping],
 ) -> Option<String> {
     if !body
         .lines()
@@ -10625,12 +11078,14 @@ fn openai_chat_sse_body_to_codex_sse(
         &tool_calls,
         available_tool_names,
         custom_tool_names,
+        namespace_tool_mappings,
     );
     if text.trim().is_empty() && !tool_items.is_empty() {
         return accumulated_openai_tool_calls_to_codex_sse(
             &tool_calls,
             available_tool_names,
             custom_tool_names,
+            namespace_tool_mappings,
         );
     }
 
@@ -10700,6 +11155,7 @@ fn openai_chat_tool_calls_to_codex_sse(
     upstream_usage: Option<&serde_json::Value>,
     available_tool_names: &[String],
     custom_tool_names: &[String],
+    namespace_tool_mappings: &[NamespaceToolMapping],
 ) -> Option<String> {
     let tool_calls = root
         .get("choices")
@@ -10724,8 +11180,14 @@ fn openai_chat_tool_calls_to_codex_sse(
                 tool_call,
                 available_tool_names,
                 custom_tool_names,
+                namespace_tool_mappings,
             )
         })
+        .collect::<Vec<_>>();
+    let mut seen_tool_calls = HashSet::new();
+    let output_items = output_items
+        .into_iter()
+        .filter(|item| seen_tool_calls.insert(codex_tool_call_fingerprint(item)))
         .collect::<Vec<_>>();
     if output_items.is_empty() {
         return None;
@@ -10782,6 +11244,17 @@ fn openai_chat_tool_calls_to_codex_sse(
         }),
     ));
     Some(body)
+}
+
+fn codex_tool_call_fingerprint(item: &serde_json::Value) -> String {
+    serde_json::json!({
+        "type": item.get("type").cloned().unwrap_or_default(),
+        "namespace": item.get("namespace").cloned().unwrap_or_default(),
+        "name": item.get("name").cloned().unwrap_or_default(),
+        "arguments": item.get("arguments").cloned().unwrap_or_default(),
+        "input": item.get("input").cloned().unwrap_or_default()
+    })
+    .to_string()
 }
 
 fn append_codex_output_item_sse_events(
@@ -10909,10 +11382,16 @@ fn openai_chat_tool_call_to_responses_item(
     tool_call: &serde_json::Value,
     available_tool_names: &[String],
     custom_tool_names: &[String],
+    namespace_tool_mappings: &[NamespaceToolMapping],
 ) -> Option<serde_json::Value> {
     let function = tool_call.get("function")?;
     let raw_name = function.get("name")?.as_str()?.trim();
-    let name = normalize_upstream_tool_name(raw_name, available_tool_names);
+    let namespace_mapping = namespace_tool_mappings
+        .iter()
+        .find(|mapping| mapping.flattened_name == raw_name);
+    let name = namespace_mapping
+        .map(|mapping| mapping.name.clone())
+        .unwrap_or_else(|| normalize_upstream_tool_name(raw_name, available_tool_names));
     if name.is_empty() {
         return None;
     }
@@ -10944,14 +11423,18 @@ fn openai_chat_tool_call_to_responses_item(
             "input": input
         }))
     } else {
-        Some(serde_json::json!({
+        let mut item = serde_json::json!({
             "id": format!("fc_{}", current_log_millis()),
             "type": "function_call",
             "status": "completed",
             "call_id": call_id,
             "name": name,
             "arguments": arguments
-        }))
+        });
+        if let Some(mapping) = namespace_mapping {
+            item["namespace"] = serde_json::Value::String(mapping.namespace.clone());
+        }
+        Some(item)
     }
 }
 
@@ -12319,6 +12802,7 @@ fn accumulated_openai_tool_calls_to_responses_items(
     tool_calls: &[OpenAiStreamToolCall],
     available_tool_names: &[String],
     custom_tool_names: &[String],
+    namespace_tool_mappings: &[NamespaceToolMapping],
 ) -> Vec<serde_json::Value> {
     accumulated_openai_tool_calls_to_values(tool_calls)
         .iter()
@@ -12327,6 +12811,7 @@ fn accumulated_openai_tool_calls_to_responses_items(
                 tool_call,
                 available_tool_names,
                 custom_tool_names,
+                namespace_tool_mappings,
             )
         })
         .collect()
@@ -12336,6 +12821,7 @@ fn accumulated_openai_tool_calls_to_codex_sse(
     tool_calls: &[OpenAiStreamToolCall],
     available_tool_names: &[String],
     custom_tool_names: &[String],
+    namespace_tool_mappings: &[NamespaceToolMapping],
 ) -> Option<String> {
     let tool_call_values = accumulated_openai_tool_calls_to_values(tool_calls);
     if tool_call_values.is_empty() {
@@ -12348,8 +12834,14 @@ fn accumulated_openai_tool_calls_to_codex_sse(
             }
         }]
     });
-    openai_chat_tool_calls_to_codex_sse(&root, None, available_tool_names, custom_tool_names)
-        .map(|body| ensure_responses_stream_completed(body, HEADER_EVENT_STREAM))
+    openai_chat_tool_calls_to_codex_sse(
+        &root,
+        None,
+        available_tool_names,
+        custom_tool_names,
+        namespace_tool_mappings,
+    )
+    .map(|body| ensure_responses_stream_completed(body, HEADER_EVENT_STREAM))
 }
 
 fn stream_openai_chat_sse_as_codex(
@@ -12359,6 +12851,7 @@ fn stream_openai_chat_sse_as_codex(
     uses_image_generation_tool: bool,
     available_tool_names: &[String],
     custom_tool_names: &[String],
+    namespace_tool_mappings: &[NamespaceToolMapping],
     full_debug_id: Option<&str>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(response.into_reader());
@@ -12491,12 +12984,14 @@ fn stream_openai_chat_sse_as_codex(
         &tool_calls,
         available_tool_names,
         custom_tool_names,
+        namespace_tool_mappings,
     );
     if !tool_items.is_empty() && !stream_started {
         if let Some(tool_sse) = accumulated_openai_tool_calls_to_codex_sse(
             &tool_calls,
             available_tool_names,
             custom_tool_names,
+            namespace_tool_mappings,
         ) {
             stream.write_all(tool_sse.as_bytes())?;
             return stream.flush();
@@ -21474,11 +21969,11 @@ pub use app::{run, run_router_only};
 mod tests {
     use super::{
         active_rollout_path, build_openai_chat_body, codex_completed_sse_from_text,
-        codex_sse_error_response, codex_sse_transport_status_code,
+        codex_sse_error_response, codex_sse_transport_status_code, collect_namespace_tool_mappings,
         custom_empty_response_is_image_generation_unsupported,
         custom_image_generation_response_needs_notice, custom_upstream_timeout_seconds,
-        ensure_official_sse_completed, normalize_official_codex_payload,
-        normalize_repeated_tool_names_in_body,
+        ensure_official_sse_completed, guard_wait_tool_for_upstream,
+        normalize_official_codex_payload, normalize_repeated_tool_names_in_body,
         normalize_repeated_tool_names_in_body_with_available,
         normalize_repeated_tool_names_in_sse_line, openai_chat_sse_body_to_codex_sse,
         openai_chat_tool_calls_to_codex_sse, remove_codex_router_top_level_keys,
@@ -21787,7 +22282,7 @@ model = "project-model"
             "data: [DONE]\n\n",
         );
 
-        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[], &[]).unwrap();
+        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[], &[], &[]).unwrap();
 
         assert!(converted.contains("event: response.output_text.delta"));
         assert!(converted.contains("hello world"));
@@ -21801,7 +22296,8 @@ model = "project-model"
         let body = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"execexec","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
         let root = serde_json::from_str::<serde_json::Value>(body).unwrap();
         let converted =
-            openai_chat_tool_calls_to_codex_sse(&root, None, &["exec".to_string()], &[]).unwrap();
+            openai_chat_tool_calls_to_codex_sse(&root, None, &["exec".to_string()], &[], &[])
+                .unwrap();
 
         assert!(converted.contains(r#""name":"exec""#));
         assert!(!converted.contains(r#""name":"execexec""#));
@@ -21849,6 +22345,277 @@ model = "project-model"
     }
 
     #[test]
+    fn chat_bridge_only_exposes_wait_for_a_real_active_exec_cell() {
+        let route = ProviderRoute {
+            provider: "test".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key: String::new(),
+            real_model: "gpt-test".to_string(),
+            proxy_mode: "direct".to_string(),
+            proxy_url: String::new(),
+            protocol_type: "openai".to_string(),
+            endpoint_path: "/chat/completions".to_string(),
+        };
+        let mut payload = serde_json::json!({
+            "input": [{"role": "user", "content": "run a command"}],
+            "tools": [
+                {"type": "custom", "name": "exec", "description": "shell"},
+                {
+                    "type": "function",
+                    "name": "wait",
+                    "description": "wait for an exec cell",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cell_id": {"type": "string"}},
+                        "required": ["cell_id"]
+                    }
+                }
+            ],
+            "parallel_tool_calls": true
+        });
+
+        let without_active_cell = build_openai_chat_body(&payload, &route);
+        assert_eq!(without_active_cell["parallel_tool_calls"], false);
+        assert_eq!(without_active_cell["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(without_active_cell["tools"][0]["function"]["name"], "exec");
+
+        payload["input"] = serde_json::json!([
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "run"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": "Script running with cell ID cell-24"
+            }
+        ]);
+        let with_active_cell = build_openai_chat_body(&payload, &route);
+        let wait_tool = with_active_cell["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "wait")
+            .unwrap();
+        assert_eq!(
+            wait_tool["function"]["parameters"]["properties"]["cell_id"]["enum"],
+            serde_json::json!(["cell-24"])
+        );
+        assert!(wait_tool["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Never invent"));
+
+        payload["input"].as_array_mut().unwrap().extend(
+            serde_json::json!([
+                {
+                    "type": "function_call",
+                    "call_id": "call_wait",
+                    "name": "wait",
+                    "arguments": "{\"cell_id\":\"cell-24\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_wait",
+                    "output": "Script completed\nExit code: 0"
+                }
+            ])
+            .as_array()
+            .unwrap()
+            .clone(),
+        );
+        let after_completion = build_openai_chat_body(&payload, &route);
+        assert!(after_completion["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["function"]["name"] != "wait"));
+    }
+
+    #[test]
+    fn responses_guard_filters_wait_namespace_until_exec_cell_is_running() {
+        let mut payload = serde_json::json!({
+            "input": [{"role": "user", "content": "work"}],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "exec",
+                    "tools": [{"type": "custom", "name": "exec"}]
+                },
+                {
+                    "type": "namespace",
+                    "name": "wait",
+                    "tools": [{
+                        "type": "function",
+                        "name": "wait",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cell_id": {"type": "string"}}
+                        }
+                    }]
+                }
+            ],
+            "tool_choice": {"type": "function", "namespace": "wait", "name": "wait"},
+            "parallel_tool_calls": true
+        });
+
+        guard_wait_tool_for_upstream(&mut payload);
+        assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["tools"][0]["name"], "exec");
+        assert_eq!(payload["tool_choice"], "auto");
+        assert_eq!(payload["parallel_tool_calls"], false);
+
+        payload["input"] = serde_json::json!([
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "run"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": "Script running with cell ID live-7"
+            }
+        ]);
+        payload["tools"] = serde_json::json!([{
+            "type": "namespace",
+            "name": "wait",
+            "tools": [{
+                "type": "function",
+                "name": "wait",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cell_id": {"type": "string"}}
+                }
+            }]
+        }]);
+        guard_wait_tool_for_upstream(&mut payload);
+        assert_eq!(
+            payload["tools"][0]["tools"][0]["parameters"]["properties"]["cell_id"]["enum"],
+            serde_json::json!(["live-7"])
+        );
+    }
+
+    #[test]
+    fn chat_bridge_round_trips_namespace_tool_name() {
+        let route = ProviderRoute {
+            provider: "test".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key: String::new(),
+            real_model: "gpt-test".to_string(),
+            proxy_mode: "direct".to_string(),
+            proxy_url: String::new(),
+            protocol_type: "openai".to_string(),
+            endpoint_path: "/chat/completions".to_string(),
+        };
+        let payload = serde_json::json!({
+            "input": [{"role": "user", "content": "send"}],
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "agent tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "send_message",
+                    "description": "send a message",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"]
+                    }
+                }]
+            }]
+        });
+
+        let chat_body = build_openai_chat_body(&payload, &route);
+        assert_eq!(
+            chat_body["tools"][0]["function"]["name"],
+            "collaboration__send_message"
+        );
+        let mappings = collect_namespace_tool_mappings(&payload);
+        let root = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_send",
+                        "type": "function",
+                        "function": {
+                            "name": "collaboration__send_message",
+                            "arguments": "{\"message\":\"hello\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let converted =
+            openai_chat_tool_calls_to_codex_sse(&root, None, &[], &[], &mappings).unwrap();
+        assert!(converted.contains(r#""name":"send_message""#));
+        assert!(converted.contains(r#""namespace":"collaboration""#));
+        assert!(!converted.contains(r#""name":"collaboration__send_message""#));
+    }
+
+    #[test]
+    fn chat_bridge_deduplicates_identical_parallel_tool_calls() {
+        let root = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": {"name": "wait", "arguments": "{\"cell_id\":\"live-1\"}"}
+                        },
+                        {
+                            "id": "call_b",
+                            "type": "function",
+                            "function": {"name": "wait", "arguments": "{\"cell_id\":\"live-1\"}"}
+                        }
+                    ]
+                }
+            }]
+        });
+
+        let converted = openai_chat_tool_calls_to_codex_sse(&root, None, &[], &[], &[]).unwrap();
+        assert_eq!(
+            converted
+                .matches("event: response.output_item.done")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn chat_bridge_converts_orphan_tool_output_to_user_context() {
+        let route = ProviderRoute {
+            provider: "test".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key: String::new(),
+            real_model: "gpt-test".to_string(),
+            proxy_mode: "direct".to_string(),
+            proxy_url: String::new(),
+            protocol_type: "openai".to_string(),
+            endpoint_path: "/chat/completions".to_string(),
+        };
+        let payload = serde_json::json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "missing_call",
+                "output": "result"
+            }]
+        });
+
+        let chat_body = build_openai_chat_body(&payload, &route);
+        assert_eq!(chat_body["messages"][0]["role"], "user");
+        assert!(chat_body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable call missing_call"));
+    }
+
+    #[test]
     fn chat_tool_call_is_restored_as_codex_custom_tool_call() {
         let root = serde_json::json!({
             "choices": [{
@@ -21870,6 +22637,7 @@ model = "project-model"
             None,
             &["exec".to_string()],
             &["exec".to_string()],
+            &[],
         )
         .unwrap();
 
@@ -22041,7 +22809,7 @@ model = "project-model"
     fn duplicated_upstream_tool_name_is_normalized_even_when_tool_list_missing() {
         let body = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"execexec","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
         let root = serde_json::from_str::<serde_json::Value>(body).unwrap();
-        let converted = openai_chat_tool_calls_to_codex_sse(&root, None, &[], &[]).unwrap();
+        let converted = openai_chat_tool_calls_to_codex_sse(&root, None, &[], &[], &[]).unwrap();
 
         assert!(converted.contains(r#""name":"exec""#));
         assert!(!converted.contains(r#""name":"execexec""#));
@@ -22066,7 +22834,8 @@ model = "project-model"
         );
 
         let converted =
-            openai_chat_sse_body_to_codex_sse(body, &route, &["wait".to_string()], &[]).unwrap();
+            openai_chat_sse_body_to_codex_sse(body, &route, &["wait".to_string()], &[], &[])
+                .unwrap();
 
         assert!(converted.contains(r#""name":"wait""#));
         assert!(!converted.contains(r#""name":"waitwait""#));
@@ -22090,7 +22859,7 @@ model = "project-model"
             "data: [DONE]\n\n",
         );
 
-        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[], &[]).unwrap();
+        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[], &[], &[]).unwrap();
 
         assert!(converted.contains(r#""name":"wait""#));
         assert!(!converted.contains(r#""name":"waitwait""#));
