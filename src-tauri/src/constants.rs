@@ -244,6 +244,7 @@ pub(crate) const HTTP_FORBIDDEN: u16 = 403;
 pub(crate) const HTTP_NOT_FOUND: u16 = 404;
 pub(crate) const HTTP_METHOD_NOT_ALLOWED: u16 = 405;
 pub(crate) const HTTP_PAYLOAD_TOO_LARGE: u16 = 413;
+pub(crate) const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 pub(crate) const HTTP_BAD_GATEWAY: u16 = 502;
 pub(crate) const HTTP_SERVICE_UNAVAILABLE: u16 = 503;
 #[cfg(windows)]

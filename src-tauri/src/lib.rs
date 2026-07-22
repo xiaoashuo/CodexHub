@@ -6257,9 +6257,25 @@ fn stream_custom_responses_request(
     route: ProviderRoute,
 ) -> std::io::Result<RouterLogEntry> {
     let protocol_type = normalize_protocol_type(&route.protocol_type);
-    let (upstream_url, upstream_body) =
-        build_custom_streaming_upstream_request(&mut payload, &route, &protocol_type)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let use_codex_chat_tool_bridge =
+        protocol_type == "cpamc" && request_has_codex_custom_tools(&payload);
+    let effective_protocol_type = if use_codex_chat_tool_bridge {
+        "openai".to_string()
+    } else {
+        protocol_type.clone()
+    };
+    let mut effective_route = route.clone();
+    if use_codex_chat_tool_bridge {
+        effective_route.protocol_type = "openai".to_string();
+        effective_route.endpoint_path = CHAT_COMPLETIONS_ENDPOINT_SUFFIX.to_string();
+    }
+    let available_tool_names = collect_available_tool_names(&payload);
+    let (upstream_url, upstream_body) = build_custom_streaming_upstream_request(
+        &mut payload,
+        &effective_route,
+        &effective_protocol_type,
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let full_debug_id = format!("custom-stream-{}", current_log_millis());
     append_router_full_debug_log(
         "custom_streaming_request",
@@ -6270,6 +6286,8 @@ fn stream_custom_responses_request(
             "path": request.path,
             "target_provider": route.provider.clone(),
             "protocol_type": protocol_type.clone(),
+            "effective_protocol_type": effective_protocol_type.clone(),
+            "codex_chat_tool_bridge": use_codex_chat_tool_bridge,
             "upstream_url": upstream_url.clone(),
             "client_request_body": router_full_debug_body_value(&String::from_utf8_lossy(&request.body)),
             "normalized_payload": payload.clone(),
@@ -6295,7 +6313,7 @@ fn stream_custom_responses_request(
     let upstream_result = send_custom_upstream_request_with_retries(
         &upstream_url,
         effective_proxy_url.as_deref(),
-        &protocol_type,
+        &effective_protocol_type,
         &route.api_key,
         &authorization,
         &upstream_body,
@@ -6334,21 +6352,21 @@ fn stream_custom_responses_request(
                 let image_generation_needs_notice = uses_image_generation_tool
                     && custom_image_generation_response_needs_notice(&body, &content_type);
                 let upstream_empty_text =
-                    custom_upstream_response_is_empty_text(&body, &protocol_type);
+                    custom_upstream_response_is_empty_text(&body, &effective_protocol_type);
                 if uses_image_generation_tool || upstream_empty_text {
                     append_router_debug_log(
                         "custom_streaming_upstream_response",
                         serde_json::json!({
                             "requested_model": payload.get("model").cloned(),
                             "target_provider": route.provider.clone(),
-                            "protocol_type": protocol_type.clone(),
+                            "protocol_type": effective_protocol_type.clone(),
                             "status_code": status_code,
                             "content_type": content_type,
                             "uses_image_generation_tool": uses_image_generation_tool,
                             "image_generation_needs_notice": image_generation_needs_notice,
                             "upstream_empty_text": upstream_empty_text,
                             "contains_image_generation_result": response_contains_image_generation_result(&body),
-                            "extracted_text": extract_text_for_debug(&body, &content_type, &protocol_type),
+                            "extracted_text": extract_text_for_debug(&body, &content_type, &effective_protocol_type),
                             "raw_body": router_debug_body_value(&body)
                         }),
                     );
@@ -6393,7 +6411,7 @@ fn stream_custom_responses_request(
                             uses_image_generation_tool,
                             &body,
                             &content_type,
-                            &protocol_type,
+                            &effective_protocol_type,
                         ) {
                             (
                                 "custom_image_generation_not_supported",
@@ -6438,14 +6456,21 @@ fn stream_custom_responses_request(
                         error_detail,
                     });
                 }
-                let body = if protocol_type == "cpamc" {
+                let body = if effective_protocol_type == "cpamc" {
                     ensure_responses_stream_completed(
-                        normalize_repeated_tool_names_in_body(&body),
+                        normalize_repeated_tool_names_in_body_with_available(
+                            &body,
+                            &available_tool_names,
+                        ),
                         &content_type,
                     )
                 } else {
-                    let wrapped =
-                        wrap_chat_response_as_responses(&body, &route, &protocol_type, &payload);
+                    let wrapped = wrap_chat_response_as_responses(
+                        &body,
+                        &effective_route,
+                        &effective_protocol_type,
+                        &payload,
+                    );
                     ensure_responses_stream_completed(wrapped, &content_type)
                 };
                 let response_usage = extract_token_usage_from_body(&body);
@@ -6468,7 +6493,7 @@ fn stream_custom_responses_request(
                     HEADER_EVENT_STREAM,
                     body.as_bytes(),
                 )?;
-            } else if protocol_type == "cpamc" {
+            } else if effective_protocol_type == "cpamc" {
                 append_router_full_debug_log(
                     "custom_streaming_upstream_sse_start",
                     serde_json::json!({
@@ -6484,8 +6509,12 @@ fn stream_custom_responses_request(
                     &build_status_line(status_code),
                     HEADER_EVENT_STREAM,
                 )?;
-                if let Err(error) = stream_raw_upstream_sse(response, stream, Some(&full_debug_id))
-                {
+                if let Err(error) = stream_raw_upstream_sse(
+                    response,
+                    stream,
+                    Some(&full_debug_id),
+                    &available_tool_names,
+                ) {
                     error_detail = format!("upstream stream disconnected: {}", error);
                 }
             } else {
@@ -6506,12 +6535,14 @@ fn stream_custom_responses_request(
                 )?;
                 let uses_image_generation_tool = request_uses_image_generation_tool(&payload);
                 let available_tool_names = collect_available_tool_names(&payload);
+                let custom_tool_names = collect_custom_tool_names(&payload);
                 if let Err(error) = stream_openai_chat_sse_as_codex(
                     response,
                     stream,
-                    &route,
+                    &effective_route,
                     uses_image_generation_tool,
                     &available_tool_names,
+                    &custom_tool_names,
                     Some(&full_debug_id),
                 ) {
                     error_detail = format!("upstream stream disconnected: {}", error);
@@ -6532,9 +6563,14 @@ fn stream_custom_responses_request(
                 }),
             );
             error_detail = format!("upstream status {}", upstream_status);
+            let error_code = if upstream_status == HTTP_TOO_MANY_REQUESTS {
+                "upstream_rate_limited"
+            } else {
+                "upstream_status"
+            };
             let response = codex_sse_error_response(
                 upstream_status,
-                "upstream_status",
+                error_code,
                 &format!("upstream returned status {}: {}", upstream_status, body),
                 route.provider.clone(),
             );
@@ -9260,7 +9296,10 @@ fn forward_custom_responses_request(
                 );
             }
             let body = if protocol_type == "cpamc" {
-                normalize_repeated_tool_names_in_body(&body)
+                normalize_repeated_tool_names_in_body_with_available(
+                    &body,
+                    &collect_available_tool_names(&payload),
+                )
             } else {
                 wrap_chat_response_as_responses(&body, &route, &protocol_type, &payload)
             };
@@ -9319,9 +9358,14 @@ fn forward_custom_responses_request(
                     "upstream_body": router_full_debug_body_value(&body)
                 }),
             );
+            let error_code = if status_code == HTTP_TOO_MANY_REQUESTS {
+                "upstream_rate_limited"
+            } else {
+                "upstream_status"
+            };
             codex_sse_error_response(
                 status_code,
-                "upstream_status",
+                error_code,
                 &format!("上游返回状态码 {}：{}", status_code, body),
                 route.provider,
             )
@@ -9605,8 +9649,11 @@ fn build_openai_chat_body(payload: &serde_json::Value, route: &ProviderRoute) ->
         body.insert("tools".to_string(), serde_json::Value::Array(tools));
     }
 
-    if let Some(tool_choice) = payload.get("tool_choice").cloned() {
-        body.insert("tool_choice".to_string(), tool_choice);
+    if let Some(tool_choice) = payload.get("tool_choice") {
+        body.insert(
+            "tool_choice".to_string(),
+            convert_responses_tool_choice_to_chat(tool_choice),
+        );
     }
 
     if let Some(parallel_tool_calls) = payload.get("parallel_tool_calls").cloned() {
@@ -9688,7 +9735,7 @@ fn extract_chat_messages(payload: &serde_json::Value, omit_system: bool) -> Vec<
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
 
-                if item_type == "function_call" {
+                if item_type == "function_call" || item_type == "custom_tool_call" {
                     pending_function_calls.push(item.clone());
                 } else {
                     if !pending_function_calls.is_empty() {
@@ -9743,15 +9790,22 @@ fn merge_function_calls_into_assistant(
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .unwrap_or("call_router");
-            let arguments = fc
-                .get("arguments")
-                .and_then(|a| a.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
+            let arguments =
+                if fc.get("type").and_then(|value| value.as_str()) == Some("custom_tool_call") {
+                    serde_json::json!({
+                        "input": fc.get("input").cloned().unwrap_or_default()
+                    })
+                    .to_string()
+                } else {
                     fc.get("arguments")
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| "{}".to_string())
-                });
+                        .and_then(|a| a.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            fc.get("arguments")
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "{}".to_string())
+                        })
+                };
 
             Some(serde_json::json!({
                 "id": call_id,
@@ -9795,6 +9849,30 @@ fn convert_responses_tool_to_chat_tool(tool: &serde_json::Value) -> Option<serde
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
+    if tool_type == "custom" {
+        let name = tool.get("name")?.as_str()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description").cloned().unwrap_or_else(|| {
+                    serde_json::Value::String(
+                        "Raw string input for the original Codex custom tool".to_string(),
+                    )
+                }),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": { "type": "string" }
+                    },
+                    "required": ["input"]
+                }
+            }
+        }));
+    }
     if tool_type != "function" {
         return None;
     }
@@ -9826,6 +9904,19 @@ fn convert_responses_tool_to_chat_tool(tool: &serde_json::Value) -> Option<serde
     }))
 }
 
+fn convert_responses_tool_choice_to_chat(tool_choice: &serde_json::Value) -> serde_json::Value {
+    let choice_type = tool_choice.get("type").and_then(|value| value.as_str());
+    if choice_type == Some("custom") || choice_type == Some("function") {
+        if let Some(name) = tool_choice.get("name").and_then(|value| value.as_str()) {
+            return serde_json::json!({
+                "type": "function",
+                "function": { "name": name }
+            });
+        }
+    }
+    tool_choice.clone()
+}
+
 fn normalize_chat_message(
     value: &serde_json::Value,
     omit_system: bool,
@@ -9834,10 +9925,10 @@ fn normalize_chat_message(
         .get("type")
         .and_then(|item_type| item_type.as_str())
         .unwrap_or_default();
-    if item_type == "function_call" {
+    if item_type == "function_call" || item_type == "custom_tool_call" {
         return normalize_responses_function_call(value);
     }
-    if item_type == "function_call_output" {
+    if item_type == "function_call_output" || item_type == "custom_tool_call_output" {
         return normalize_responses_function_call_output(value);
     }
 
@@ -9894,16 +9985,24 @@ fn normalize_responses_function_call(value: &serde_json::Value) -> Option<serde_
         .map(str::trim)
         .filter(|call_id| !call_id.is_empty())
         .unwrap_or("call_router");
-    let arguments = value
-        .get("arguments")
-        .and_then(|arguments| arguments.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
+    let arguments =
+        if value.get("type").and_then(|item_type| item_type.as_str()) == Some("custom_tool_call") {
+            serde_json::json!({
+                "input": value.get("input").cloned().unwrap_or_default()
+            })
+            .to_string()
+        } else {
             value
                 .get("arguments")
-                .map(|arguments| arguments.to_string())
-                .unwrap_or_else(|| "{}".to_string())
-        });
+                .and_then(|arguments| arguments.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    value
+                        .get("arguments")
+                        .map(|arguments| arguments.to_string())
+                        .unwrap_or_else(|| "{}".to_string())
+                })
+        };
 
     Some(serde_json::json!({
         "role": "assistant",
@@ -10405,10 +10504,14 @@ fn wrap_chat_response_as_responses(
     original_payload: &serde_json::Value,
 ) -> String {
     let available_tool_names = collect_available_tool_names(original_payload);
+    let custom_tool_names = collect_custom_tool_names(original_payload);
     if protocol_type != "anthropic" {
-        if let Some(sse_body) =
-            openai_chat_sse_body_to_codex_sse(body, route, &available_tool_names)
-        {
+        if let Some(sse_body) = openai_chat_sse_body_to_codex_sse(
+            body,
+            route,
+            &available_tool_names,
+            &custom_tool_names,
+        ) {
             return sse_body;
         }
     }
@@ -10418,9 +10521,12 @@ fn wrap_chat_response_as_responses(
         Err(_) => return body.to_string(),
     };
     if protocol_type != "anthropic" {
-        if let Some(tool_sse) =
-            openai_chat_tool_calls_to_codex_sse(&root, root.get("usage"), &available_tool_names)
-        {
+        if let Some(tool_sse) = openai_chat_tool_calls_to_codex_sse(
+            &root,
+            root.get("usage"),
+            &available_tool_names,
+            &custom_tool_names,
+        ) {
             return tool_sse;
         }
     }
@@ -10474,6 +10580,7 @@ fn openai_chat_sse_body_to_codex_sse(
     body: &str,
     route: &ProviderRoute,
     available_tool_names: &[String],
+    custom_tool_names: &[String],
 ) -> Option<String> {
     if !body
         .lines()
@@ -10514,10 +10621,17 @@ fn openai_chat_sse_body_to_codex_sse(
         return None;
     }
 
-    let tool_items =
-        accumulated_openai_tool_calls_to_responses_items(&tool_calls, available_tool_names);
+    let tool_items = accumulated_openai_tool_calls_to_responses_items(
+        &tool_calls,
+        available_tool_names,
+        custom_tool_names,
+    );
     if text.trim().is_empty() && !tool_items.is_empty() {
-        return accumulated_openai_tool_calls_to_codex_sse(&tool_calls, available_tool_names);
+        return accumulated_openai_tool_calls_to_codex_sse(
+            &tool_calls,
+            available_tool_names,
+            custom_tool_names,
+        );
     }
 
     let raw_response = serde_json::json!({
@@ -10585,6 +10699,7 @@ fn openai_chat_tool_calls_to_codex_sse(
     root: &serde_json::Value,
     upstream_usage: Option<&serde_json::Value>,
     available_tool_names: &[String],
+    custom_tool_names: &[String],
 ) -> Option<String> {
     let tool_calls = root
         .get("choices")
@@ -10605,7 +10720,11 @@ fn openai_chat_tool_calls_to_codex_sse(
     let output_items = tool_calls
         .iter()
         .filter_map(|tool_call| {
-            openai_chat_tool_call_to_responses_item(tool_call, available_tool_names)
+            openai_chat_tool_call_to_responses_item(
+                tool_call,
+                available_tool_names,
+                custom_tool_names,
+            )
         })
         .collect::<Vec<_>>();
     if output_items.is_empty() {
@@ -10653,22 +10772,7 @@ fn openai_chat_tool_calls_to_codex_sse(
         }),
     ));
     for (index, item) in output_items.iter().enumerate() {
-        body.push_str(&sse_event(
-            "response.output_item.added",
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "output_index": index,
-                "item": item
-            }),
-        ));
-        body.push_str(&sse_event(
-            "response.output_item.done",
-            serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": index,
-                "item": item
-            }),
-        ));
+        append_codex_output_item_sse_events(&mut body, index, item);
     }
     body.push_str(&sse_event(
         "response.completed",
@@ -10680,9 +10784,131 @@ fn openai_chat_tool_calls_to_codex_sse(
     Some(body)
 }
 
+fn append_codex_output_item_sse_events(
+    body: &mut String,
+    output_index: usize,
+    completed_item: &serde_json::Value,
+) {
+    for (event_name, event_data) in codex_output_item_sse_events(output_index, completed_item) {
+        body.push_str(&sse_event(event_name, event_data));
+    }
+}
+
+fn codex_output_item_sse_events(
+    output_index: usize,
+    completed_item: &serde_json::Value,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let item_type = completed_item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let item_id = completed_item
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let mut added_item = completed_item.clone();
+    if let Some(object) = added_item.as_object_mut() {
+        object.insert(
+            "status".to_string(),
+            serde_json::Value::String("in_progress".to_string()),
+        );
+        match item_type {
+            "custom_tool_call" => {
+                object.insert(
+                    "input".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
+            "function_call" => {
+                object.insert(
+                    "arguments".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut events = vec![(
+        "response.output_item.added",
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": added_item
+        }),
+    )];
+
+    match item_type {
+        "custom_tool_call" => {
+            let input = completed_item
+                .get("input")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if !input.is_empty() {
+                events.push((
+                    "response.custom_tool_call_input.delta",
+                    serde_json::json!({
+                        "type": "response.custom_tool_call_input.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": input
+                    }),
+                ));
+            }
+            events.push((
+                "response.custom_tool_call_input.done",
+                serde_json::json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "input": input
+                }),
+            ));
+        }
+        "function_call" => {
+            let arguments = completed_item
+                .get("arguments")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if !arguments.is_empty() {
+                events.push((
+                    "response.function_call_arguments.delta",
+                    serde_json::json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": arguments
+                    }),
+                ));
+            }
+            events.push((
+                "response.function_call_arguments.done",
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "arguments": arguments
+                }),
+            ));
+        }
+        _ => {}
+    }
+
+    events.push((
+        "response.output_item.done",
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": completed_item
+        }),
+    ));
+    events
+}
+
 fn openai_chat_tool_call_to_responses_item(
     tool_call: &serde_json::Value,
     available_tool_names: &[String],
+    custom_tool_names: &[String],
 ) -> Option<serde_json::Value> {
     let function = tool_call.get("function")?;
     let raw_name = function.get("name")?.as_str()?.trim();
@@ -10707,14 +10933,26 @@ fn openai_chat_tool_call_to_responses_item(
                 .unwrap_or_else(|| "{}".to_string())
         });
 
-    Some(serde_json::json!({
-        "id": format!("fc_{}", current_log_millis()),
-        "type": "function_call",
-        "status": "completed",
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments
-    }))
+    if custom_tool_names.iter().any(|candidate| candidate == &name) {
+        let input = extract_custom_tool_input_from_chat_arguments(&arguments);
+        Some(serde_json::json!({
+            "id": format!("ctc_{}", call_id),
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "input": input
+        }))
+    } else {
+        Some(serde_json::json!({
+            "id": format!("fc_{}", current_log_millis()),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments
+        }))
+    }
 }
 
 fn collect_available_tool_names(payload: &serde_json::Value) -> Vec<String> {
@@ -10729,6 +10967,45 @@ fn collect_available_tool_names(payload: &serde_json::Value) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn collect_custom_tool_names(payload: &serde_json::Value) -> Vec<String> {
+    payload
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.get("type").and_then(|value| value.as_str()) == Some("custom"))
+                .filter_map(extract_tool_definition_name)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn request_has_codex_custom_tools(payload: &serde_json::Value) -> bool {
+    payload
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|tools| {
+            tools.iter().any(|tool| match tool {
+                serde_json::Value::String(name) => !name.trim().is_empty(),
+                serde_json::Value::Object(_) => {
+                    tool.get("type").and_then(|value| value.as_str()) == Some("custom")
+                }
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn extract_custom_tool_input_from_chat_arguments(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("input").cloned())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| arguments.to_string())
 }
 
 fn extract_tool_definition_name(tool: &serde_json::Value) -> Option<&str> {
@@ -10756,11 +11033,29 @@ fn normalize_upstream_tool_name(raw_name: &str, available_tool_names: &[String])
         return name.to_string();
     }
 
+    for candidate in available_tool_names {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || candidate == name || name.len() % candidate.len() != 0 {
+            continue;
+        }
+        if name
+            .as_bytes()
+            .chunks(candidate.len())
+            .all(|chunk| chunk == candidate.as_bytes())
+        {
+            return candidate.to_string();
+        }
+    }
+
     if name.len() % 2 == 0 {
         let midpoint = name.len() / 2;
-        let (left, right) = name.split_at(midpoint);
-        if left == right && !left.trim().is_empty() {
-            return left.to_string();
+        let (left, right) = name.as_bytes().split_at(midpoint);
+        if left == right {
+            if let Ok(left) = std::str::from_utf8(left) {
+                if !left.trim().is_empty() {
+                    return left.to_string();
+                }
+            }
         }
     }
 
@@ -11091,14 +11386,22 @@ fn ensure_sse_done_frame(mut body: String) -> String {
     body
 }
 
+#[cfg(test)]
 fn normalize_repeated_tool_names_in_body(body: &str) -> String {
+    normalize_repeated_tool_names_in_body_with_available(body, &[])
+}
+
+fn normalize_repeated_tool_names_in_body_with_available(
+    body: &str,
+    available_tool_names: &[String],
+) -> String {
     if body.trim().is_empty() || (!body.contains("name") && !body.contains("custom_tool_call")) {
         return body.to_string();
     }
 
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(mut value) => {
-            normalize_responses_tool_calls_in_json(&mut value);
+            normalize_responses_tool_calls_in_json(&mut value, available_tool_names);
             serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
         }
         Err(_)
@@ -11110,14 +11413,27 @@ fn normalize_repeated_tool_names_in_body(body: &str) -> String {
             }) =>
         {
             body.split_inclusive('\n')
-                .map(normalize_repeated_tool_names_in_sse_line)
+                .map(|line| {
+                    normalize_repeated_tool_names_in_sse_line_with_available(
+                        line,
+                        available_tool_names,
+                    )
+                })
                 .collect()
         }
         Err(_) => body.to_string(),
     }
 }
 
+#[cfg(test)]
 fn normalize_repeated_tool_names_in_sse_line(line: &str) -> String {
+    normalize_repeated_tool_names_in_sse_line_with_available(line, &[])
+}
+
+fn normalize_repeated_tool_names_in_sse_line_with_available(
+    line: &str,
+    available_tool_names: &[String],
+) -> String {
     let leading_len = line.len() - line.trim_start().len();
     let leading = &line[..leading_len];
     let trimmed = &line[leading_len..];
@@ -11138,7 +11454,7 @@ fn normalize_repeated_tool_names_in_sse_line(line: &str) -> String {
 
     match serde_json::from_str::<serde_json::Value>(data) {
         Ok(mut value) => {
-            normalize_responses_tool_calls_in_json(&mut value);
+            normalize_responses_tool_calls_in_json(&mut value, available_tool_names);
             match serde_json::to_string(&value) {
                 Ok(normalized) => format!("{}data: {}{}", leading, normalized, line_ending),
                 Err(_) => line.to_string(),
@@ -11148,40 +11464,38 @@ fn normalize_repeated_tool_names_in_sse_line(line: &str) -> String {
     }
 }
 
-fn normalize_responses_tool_calls_in_json(value: &mut serde_json::Value) {
+fn normalize_responses_tool_calls_in_json(
+    value: &mut serde_json::Value,
+    available_tool_names: &[String],
+) {
     match value {
         serde_json::Value::Object(object) => {
+            let is_tool_call = matches!(
+                object.get("type").and_then(|item_type| item_type.as_str()),
+                Some("custom_tool_call" | "function_call")
+            );
+            if is_tool_call {
+                object.remove("namespace");
+            }
             if let Some(name_value) = object.get_mut("name") {
                 if let Some(name) = name_value.as_str() {
-                    let normalized = normalize_repeated_name(name);
+                    let normalized = normalize_upstream_tool_name(name, available_tool_names);
                     if normalized != name {
                         *name_value = serde_json::Value::String(normalized);
                     }
                 }
             }
             for child in object.values_mut() {
-                normalize_responses_tool_calls_in_json(child);
+                normalize_responses_tool_calls_in_json(child, available_tool_names);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                normalize_responses_tool_calls_in_json(item);
+                normalize_responses_tool_calls_in_json(item, available_tool_names);
             }
         }
         _ => {}
     }
-}
-
-fn normalize_repeated_name(name: &str) -> String {
-    if name.len() % 2 == 0 {
-        let midpoint = name.len() / 2;
-        let (left, right) = name.split_at(midpoint);
-        if left == right && !left.trim().is_empty() {
-            return left.to_string();
-        }
-    }
-
-    name.to_string()
 }
 
 fn ensure_responses_stream_completed(body: String, content_type: &str) -> String {
@@ -11254,7 +11568,9 @@ fn codex_sse_error_body_for_client(code: &str, message: &str) -> String {
 fn codex_sse_error_should_render_text(code: &str) -> bool {
     matches!(
         code,
-        "custom_image_generation_not_configured" | "custom_image_generation_not_supported"
+        "custom_image_generation_not_configured"
+            | "custom_image_generation_not_supported"
+            | "upstream_rate_limited"
     )
 }
 
@@ -11265,6 +11581,7 @@ fn codex_sse_error_body(code: &str, message: &str) -> String {
         .unwrap_or_default();
     let response_id = format!("resp_{}", current_log_millis());
     let error = serde_json::json!({
+        "type": code,
         "code": code,
         "message": message
     });
@@ -11273,28 +11590,15 @@ fn codex_sse_error_body(code: &str, message: &str) -> String {
         "object": "response",
         "created_at": now,
         "status": "failed",
+        "output": [],
         "error": error
     });
 
     let mut body = String::new();
     body.push_str(&sse_event(
-        "response.created",
-        serde_json::json!({
-            "type": "response.created",
-            "response": response
-        }),
-    ));
-    body.push_str(&sse_event(
         "response.failed",
         serde_json::json!({
             "type": "response.failed",
-            "response": response
-        }),
-    ));
-    body.push_str(&sse_event(
-        "response.completed",
-        serde_json::json!({
-            "type": "response.completed",
             "response": response
         }),
     ));
@@ -11570,14 +11874,6 @@ fn write_codex_text_stream_failed(
             "response": response
         }),
     )?;
-    write_sse_event_to_stream(
-        stream,
-        "response.completed",
-        serde_json::json!({
-            "type": "response.completed",
-            "response": response
-        }),
-    )?;
     stream.write_all(b"data: [DONE]\n\n")?;
     stream.flush()
 }
@@ -11717,24 +12013,9 @@ fn write_codex_text_stream_done_with_items(
     )?;
     for (index, item) in extra_items.iter().enumerate() {
         let output_index = index + 1;
-        write_sse_event_to_stream(
-            stream,
-            "response.output_item.added",
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": item
-            }),
-        )?;
-        write_sse_event_to_stream(
-            stream,
-            "response.output_item.done",
-            serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": item
-            }),
-        )?;
+        for (event_name, event_data) in codex_output_item_sse_events(output_index, item) {
+            write_sse_event_to_stream(stream, event_name, event_data)?;
+        }
     }
     write_sse_event_to_stream(
         stream,
@@ -11781,6 +12062,7 @@ fn stream_raw_upstream_sse(
     response: ureq::Response,
     stream: &mut TcpStream,
     full_debug_id: Option<&str>,
+    available_tool_names: &[String],
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(response.into_reader());
     let mut saw_completed = false;
@@ -11807,7 +12089,8 @@ fn stream_raw_upstream_sse(
             );
             continue;
         }
-        let line = normalize_repeated_tool_names_in_sse_line(&line);
+        let line =
+            normalize_repeated_tool_names_in_sse_line_with_available(&line, available_tool_names);
         append_router_full_debug_log(
             "upstream_sse_line",
             serde_json::json!({
@@ -12035,11 +12318,16 @@ fn accumulated_openai_tool_calls_to_values(
 fn accumulated_openai_tool_calls_to_responses_items(
     tool_calls: &[OpenAiStreamToolCall],
     available_tool_names: &[String],
+    custom_tool_names: &[String],
 ) -> Vec<serde_json::Value> {
     accumulated_openai_tool_calls_to_values(tool_calls)
         .iter()
         .filter_map(|tool_call| {
-            openai_chat_tool_call_to_responses_item(tool_call, available_tool_names)
+            openai_chat_tool_call_to_responses_item(
+                tool_call,
+                available_tool_names,
+                custom_tool_names,
+            )
         })
         .collect()
 }
@@ -12047,6 +12335,7 @@ fn accumulated_openai_tool_calls_to_responses_items(
 fn accumulated_openai_tool_calls_to_codex_sse(
     tool_calls: &[OpenAiStreamToolCall],
     available_tool_names: &[String],
+    custom_tool_names: &[String],
 ) -> Option<String> {
     let tool_call_values = accumulated_openai_tool_calls_to_values(tool_calls);
     if tool_call_values.is_empty() {
@@ -12059,7 +12348,7 @@ fn accumulated_openai_tool_calls_to_codex_sse(
             }
         }]
     });
-    openai_chat_tool_calls_to_codex_sse(&root, None, available_tool_names)
+    openai_chat_tool_calls_to_codex_sse(&root, None, available_tool_names, custom_tool_names)
         .map(|body| ensure_responses_stream_completed(body, HEADER_EVENT_STREAM))
 }
 
@@ -12069,6 +12358,7 @@ fn stream_openai_chat_sse_as_codex(
     route: &ProviderRoute,
     uses_image_generation_tool: bool,
     available_tool_names: &[String],
+    custom_tool_names: &[String],
     full_debug_id: Option<&str>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(response.into_reader());
@@ -12197,12 +12487,17 @@ fn stream_openai_chat_sse_as_codex(
         write_codex_text_stream_delta(stream, &mut state, &text)?;
     }
 
-    let tool_items =
-        accumulated_openai_tool_calls_to_responses_items(&tool_calls, available_tool_names);
+    let tool_items = accumulated_openai_tool_calls_to_responses_items(
+        &tool_calls,
+        available_tool_names,
+        custom_tool_names,
+    );
     if !tool_items.is_empty() && !stream_started {
-        if let Some(tool_sse) =
-            accumulated_openai_tool_calls_to_codex_sse(&tool_calls, available_tool_names)
-        {
+        if let Some(tool_sse) = accumulated_openai_tool_calls_to_codex_sse(
+            &tool_calls,
+            available_tool_names,
+            custom_tool_names,
+        ) {
             stream.write_all(tool_sse.as_bytes())?;
             return stream.flush();
         }
@@ -21019,6 +21314,7 @@ fn build_status_line(status_code: u16) -> String {
         HTTP_NOT_FOUND => "Not Found",
         HTTP_METHOD_NOT_ALLOWED => "Method Not Allowed",
         HTTP_PAYLOAD_TOO_LARGE => "Payload Too Large",
+        HTTP_TOO_MANY_REQUESTS => "Too Many Requests",
         HTTP_BAD_GATEWAY => "Bad Gateway",
         HTTP_SERVICE_UNAVAILABLE => "Service Unavailable",
         _ => "Upstream Response",
@@ -21177,18 +21473,21 @@ pub use app::{run, run_router_only};
 #[cfg(test)]
 mod tests {
     use super::{
-        active_rollout_path, codex_completed_sse_from_text, codex_sse_error_response,
-        codex_sse_transport_status_code, custom_empty_response_is_image_generation_unsupported,
+        active_rollout_path, build_openai_chat_body, codex_completed_sse_from_text,
+        codex_sse_error_response, codex_sse_transport_status_code,
+        custom_empty_response_is_image_generation_unsupported,
         custom_image_generation_response_needs_notice, custom_upstream_timeout_seconds,
         ensure_official_sse_completed, normalize_official_codex_payload,
-        normalize_repeated_tool_names_in_body, normalize_repeated_tool_names_in_sse_line,
-        openai_chat_sse_body_to_codex_sse, openai_chat_tool_calls_to_codex_sse,
-        remove_codex_router_top_level_keys, remove_managed_codex_router_block,
-        request_uses_image_generation_tool, response_contains_tool_call_request, rollout_file_date,
-        sse_line_is_done, sse_text_has_response_completed, ProviderRoute,
-        CODEX_ROUTER_TOP_MANAGED_END_MARKER, CODEX_ROUTER_TOP_MANAGED_START_MARKER,
-        CUSTOM_IMAGE_GENERATION_UNSUPPORTED_MESSAGE, CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE,
-        FORWARD_TIMEOUT_SECONDS, HEADER_EVENT_STREAM, HEADER_JSON, HTTP_BAD_GATEWAY, HTTP_OK,
+        normalize_repeated_tool_names_in_body,
+        normalize_repeated_tool_names_in_body_with_available,
+        normalize_repeated_tool_names_in_sse_line, openai_chat_sse_body_to_codex_sse,
+        openai_chat_tool_calls_to_codex_sse, remove_codex_router_top_level_keys,
+        remove_managed_codex_router_block, request_uses_image_generation_tool,
+        response_contains_tool_call_request, rollout_file_date, sse_line_is_done,
+        sse_text_has_response_completed, ProviderRoute, CODEX_ROUTER_TOP_MANAGED_END_MARKER,
+        CODEX_ROUTER_TOP_MANAGED_START_MARKER, CUSTOM_IMAGE_GENERATION_UNSUPPORTED_MESSAGE,
+        CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE, FORWARD_TIMEOUT_SECONDS, HEADER_EVENT_STREAM,
+        HEADER_JSON, HTTP_BAD_GATEWAY, HTTP_OK, HTTP_TOO_MANY_REQUESTS,
         IMAGE_GENERATION_FORWARD_TIMEOUT_SECONDS,
     };
     use std::path::Path;
@@ -21282,12 +21581,31 @@ model = "project-model"
         assert!(response
             .body
             .contains("\"code\":\"upstream_empty_response\""));
-        assert!(response.body.contains("event: response.completed"));
+        assert!(response
+            .body
+            .contains("\"type\":\"upstream_empty_response\""));
+        assert!(!response.body.contains("event: response.completed"));
         assert!(response
             .body
             .contains(CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE));
         assert!(response.body.ends_with("data: [DONE]\n\n"));
         assert!(response.error_detail.contains("upstream_empty_response"));
+    }
+
+    #[test]
+    fn rate_limit_is_rendered_without_failed_event_to_avoid_reconnect_loop() {
+        let response = codex_sse_error_response(
+            HTTP_TOO_MANY_REQUESTS,
+            "upstream_rate_limited",
+            "model cooldown",
+            "test-provider".to_string(),
+        );
+
+        assert_eq!(response.status_code, HTTP_TOO_MANY_REQUESTS);
+        assert!(response.body.contains("event: response.completed"));
+        assert!(response.body.contains("model cooldown"));
+        assert!(!response.body.contains("event: response.failed"));
+        assert!(response.body.ends_with("data: [DONE]\n\n"));
     }
 
     #[test]
@@ -21469,7 +21787,7 @@ model = "project-model"
             "data: [DONE]\n\n",
         );
 
-        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[]).unwrap();
+        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[], &[]).unwrap();
 
         assert!(converted.contains("event: response.output_text.delta"));
         assert!(converted.contains("hello world"));
@@ -21483,10 +21801,114 @@ model = "project-model"
         let body = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"execexec","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
         let root = serde_json::from_str::<serde_json::Value>(body).unwrap();
         let converted =
-            openai_chat_tool_calls_to_codex_sse(&root, None, &["exec".to_string()]).unwrap();
+            openai_chat_tool_calls_to_codex_sse(&root, None, &["exec".to_string()], &[]).unwrap();
 
         assert!(converted.contains(r#""name":"exec""#));
         assert!(!converted.contains(r#""name":"execexec""#));
+        assert!(converted.contains("event: response.function_call_arguments.delta"));
+        assert!(converted.contains("event: response.function_call_arguments.done"));
+        assert!(converted.contains(r#""status":"in_progress""#));
+
+        let events = converted
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(events[1]["item"]["name"], "exec");
+        assert_eq!(events[4]["item"]["name"], "exec");
+        assert_eq!(events[5]["response"]["output"][0]["name"], "exec");
+    }
+
+    #[test]
+    fn codex_custom_tool_is_wrapped_for_chat_upstream() {
+        let route = ProviderRoute {
+            provider: "test".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key: String::new(),
+            real_model: "gpt-test".to_string(),
+            proxy_mode: "direct".to_string(),
+            proxy_url: String::new(),
+            protocol_type: "openai".to_string(),
+            endpoint_path: "/chat/completions".to_string(),
+        };
+        let payload = serde_json::json!({
+            "input": [{"role": "user", "content": "run a command"}],
+            "tools": [{"type": "custom", "name": "exec", "description": "shell"}],
+            "tool_choice": {"type": "custom", "name": "exec"}
+        });
+
+        let body = build_openai_chat_body(&payload, &route);
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "exec");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["required"][0],
+            "input"
+        );
+        assert_eq!(body["tool_choice"]["function"]["name"], "exec");
+    }
+
+    #[test]
+    fn chat_tool_call_is_restored_as_codex_custom_tool_call() {
+        let root = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_exec",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": "{\"input\":\"Get-ChildItem\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let converted = openai_chat_tool_calls_to_codex_sse(
+            &root,
+            None,
+            &["exec".to_string()],
+            &["exec".to_string()],
+        )
+        .unwrap();
+
+        assert!(converted.contains(r#""type":"custom_tool_call""#));
+        assert!(converted.contains(r#""name":"exec""#));
+        assert!(converted.contains(r#""input":"Get-ChildItem""#));
+        assert!(!converted.contains(r#""type":"function_call""#));
+
+        let events = converted
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .collect::<Vec<_>>();
+        let event_types = events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        let added = &events[1]["item"];
+        assert_eq!(added["status"], "in_progress");
+        assert_eq!(added["name"], "exec");
+        assert_eq!(added["input"], "");
+        let done = &events[4]["item"];
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["name"], "exec");
+        assert_eq!(done["input"], "Get-ChildItem");
+        assert_eq!(events[2]["item_id"], done["id"]);
+        assert_eq!(events[3]["item_id"], done["id"]);
+        assert_eq!(events[5]["response"]["output"][0]["name"], "exec");
     }
 
     #[test]
@@ -21499,6 +21921,27 @@ model = "project-model"
         assert!(normalized.contains(r#""input":"{}""#));
         assert!(!normalized.contains(r#""type":"function_call""#));
         assert!(!normalized.contains(r#""name":"execexec""#));
+    }
+
+    #[test]
+    fn cpamc_body_normalization_uses_tools_declared_by_codex() {
+        let body = r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","name":"execexecexec","call_id":"call_1","input":"{}"}}"#;
+        let normalized = normalize_repeated_tool_names_in_body_with_available(
+            body,
+            &["exec".to_string(), "wait".to_string()],
+        );
+
+        assert!(normalized.contains(r#""name":"exec""#));
+        assert!(!normalized.contains("execexec"));
+    }
+
+    #[test]
+    fn cpamc_body_normalization_preserves_declared_repeated_looking_name() {
+        let body = r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","name":"mama","call_id":"call_1","input":"{}"}}"#;
+        let normalized =
+            normalize_repeated_tool_names_in_body_with_available(body, &["mama".to_string()]);
+
+        assert!(normalized.contains(r#""name":"mama""#));
     }
 
     #[test]
@@ -21552,6 +21995,26 @@ model = "project-model"
     }
 
     #[test]
+    fn cpamc_done_event_keeps_custom_tool_name() {
+        let line = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"execexec\",\"namespace\":\"exec\",\"call_id\":\"call_1\",\"input\":\"{}\"}}\n\n";
+        let normalized = normalize_repeated_tool_names_in_sse_line(line);
+
+        assert!(normalized.contains(r#""name":"exec""#));
+        assert!(!normalized.contains("namespace"));
+        assert!(!normalized.contains("execexec"));
+    }
+
+    #[test]
+    fn cpamc_completed_event_removes_replayed_namespace() {
+        let line = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"namespace\":\"exec\",\"call_id\":\"call_1\",\"input\":\"{}\"}]}}\n\n";
+        let normalized = normalize_repeated_tool_names_in_sse_line(line);
+
+        assert!(normalized.contains(r#""type":"custom_tool_call""#));
+        assert!(normalized.contains(r#""name":"exec""#));
+        assert!(!normalized.contains("namespace"));
+    }
+
+    #[test]
     fn official_payload_normalization_removes_input_namespace_recursively() {
         let mut payload = serde_json::json!({
             "model": "gpt-5.6-sol",
@@ -21578,7 +22041,7 @@ model = "project-model"
     fn duplicated_upstream_tool_name_is_normalized_even_when_tool_list_missing() {
         let body = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"execexec","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
         let root = serde_json::from_str::<serde_json::Value>(body).unwrap();
-        let converted = openai_chat_tool_calls_to_codex_sse(&root, None, &[]).unwrap();
+        let converted = openai_chat_tool_calls_to_codex_sse(&root, None, &[], &[]).unwrap();
 
         assert!(converted.contains(r#""name":"exec""#));
         assert!(!converted.contains(r#""name":"execexec""#));
@@ -21603,7 +22066,7 @@ model = "project-model"
         );
 
         let converted =
-            openai_chat_sse_body_to_codex_sse(body, &route, &["wait".to_string()]).unwrap();
+            openai_chat_sse_body_to_codex_sse(body, &route, &["wait".to_string()], &[]).unwrap();
 
         assert!(converted.contains(r#""name":"wait""#));
         assert!(!converted.contains(r#""name":"waitwait""#));
@@ -21627,7 +22090,7 @@ model = "project-model"
             "data: [DONE]\n\n",
         );
 
-        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[]).unwrap();
+        let converted = openai_chat_sse_body_to_codex_sse(body, &route, &[], &[]).unwrap();
 
         assert!(converted.contains(r#""name":"wait""#));
         assert!(!converted.contains(r#""name":"waitwait""#));
