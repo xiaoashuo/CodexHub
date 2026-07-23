@@ -6256,6 +6256,7 @@ fn stream_custom_responses_request(
     mut payload: serde_json::Value,
     route: ProviderRoute,
 ) -> std::io::Result<RouterLogEntry> {
+    let active_exec_cell_ids = collect_active_exec_cell_ids(&payload);
     guard_wait_tool_for_upstream(&mut payload);
     let protocol_type = normalize_protocol_type(&route.protocol_type);
     let use_codex_chat_tool_bridge =
@@ -6515,6 +6516,7 @@ fn stream_custom_responses_request(
                     stream,
                     Some(&full_debug_id),
                     &available_tool_names,
+                    &active_exec_cell_ids,
                 ) {
                     error_detail = format!("upstream stream disconnected: {}", error);
                 }
@@ -12509,6 +12511,98 @@ fn write_codex_text_stream_done_with_items(
     stream.flush()
 }
 
+fn sanitize_inactive_wait_sse_line(
+    line: &str,
+    active_exec_cell_ids: &[String],
+    suppressed_item_ids: &mut HashSet<String>,
+) -> Option<String> {
+    if !active_exec_cell_ids.is_empty() {
+        return Some(line.to_string());
+    }
+    let leading_len = line.len() - line.trim_start().len();
+    let leading = &line[..leading_len];
+    let trimmed = &line[leading_len..];
+    let Some(data) = trimmed.strip_prefix("data:") else {
+        return Some(line.to_string());
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Some(line.to_string());
+    }
+    let Ok(mut event) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Some(line.to_string());
+    };
+    let event_type = event
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+
+    if matches!(
+        event_type,
+        "response.output_item.added" | "response.output_item.done"
+    ) {
+        if let Some(item) = event.get("item") {
+            let item_id = item
+                .get("id")
+                .or_else(|| item.get("call_id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let is_suppressed = suppressed_item_ids.contains(item_id);
+            if is_wait_tool_call_item(item) || is_suppressed {
+                if !item_id.is_empty() {
+                    suppressed_item_ids.insert(item_id.to_string());
+                }
+                return None;
+            }
+        }
+    }
+
+    if matches!(
+        event_type,
+        "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.custom_tool_call_input.delta"
+            | "response.custom_tool_call_input.done"
+    ) {
+        let item_id = event
+            .get("item_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if suppressed_item_ids.contains(item_id) {
+            return None;
+        }
+    }
+
+    if event_type == "response.completed" {
+        if let Some(output) = event
+            .get_mut("response")
+            .and_then(|response| response.get_mut("output"))
+            .and_then(|output| output.as_array_mut())
+        {
+            output.retain(|item| !is_wait_tool_call_item(item));
+        }
+    }
+
+    let line_ending = if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    serde_json::to_string(&event)
+        .ok()
+        .map(|event| format!("{}data: {}{}", leading, event, line_ending))
+}
+
+fn is_wait_tool_call_item(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(|value| value.as_str()),
+        Some("function_call" | "custom_tool_call")
+    ) && (item.get("name").and_then(|value| value.as_str()) == Some("wait")
+        || item.get("namespace").and_then(|value| value.as_str()) == Some("wait"))
+}
+
 fn write_sse_event_to_stream(
     stream: &mut TcpStream,
     event_name: &str,
@@ -12546,15 +12640,22 @@ fn stream_raw_upstream_sse(
     stream: &mut TcpStream,
     full_debug_id: Option<&str>,
     available_tool_names: &[String],
+    active_exec_cell_ids: &[String],
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(response.into_reader());
     let mut saw_completed = false;
     let mut saw_done = false;
+    let mut pending_event_line: Option<String> = None;
+    let mut suppressed_wait_item_ids = HashSet::<String>::new();
     loop {
         let mut line = String::new();
         let bytes_read = reader.read_line(&mut line)?;
         if bytes_read == 0 {
             break;
+        }
+        if line.trim_start().starts_with("event:") {
+            pending_event_line = Some(line);
+            continue;
         }
         if sse_text_has_response_completed(&line) {
             saw_completed = true;
@@ -12574,6 +12675,21 @@ fn stream_raw_upstream_sse(
         }
         let line =
             normalize_repeated_tool_names_in_sse_line_with_available(&line, available_tool_names);
+        let Some(line) = sanitize_inactive_wait_sse_line(
+            &line,
+            active_exec_cell_ids,
+            &mut suppressed_wait_item_ids,
+        ) else {
+            append_router_debug_log(
+                "inactive_wait_tool_call_suppressed",
+                serde_json::json!({
+                    "active_exec_cell_ids": active_exec_cell_ids,
+                    "suppressed_item_ids": suppressed_wait_item_ids
+                }),
+            );
+            pending_event_line = None;
+            continue;
+        };
         append_router_full_debug_log(
             "upstream_sse_line",
             serde_json::json!({
@@ -12582,6 +12698,9 @@ fn stream_raw_upstream_sse(
                 "line": router_full_debug_sse_line_value(&line)
             }),
         );
+        if let Some(event_line) = pending_event_line.take() {
+            stream.write_all(event_line.as_bytes())?;
+        }
         stream.write_all(line.as_bytes())?;
         stream.flush()?;
     }
@@ -21978,12 +22097,12 @@ mod tests {
         normalize_repeated_tool_names_in_sse_line, openai_chat_sse_body_to_codex_sse,
         openai_chat_tool_calls_to_codex_sse, remove_codex_router_top_level_keys,
         remove_managed_codex_router_block, request_uses_image_generation_tool,
-        response_contains_tool_call_request, rollout_file_date, sse_line_is_done,
-        sse_text_has_response_completed, ProviderRoute, CODEX_ROUTER_TOP_MANAGED_END_MARKER,
-        CODEX_ROUTER_TOP_MANAGED_START_MARKER, CUSTOM_IMAGE_GENERATION_UNSUPPORTED_MESSAGE,
-        CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE, FORWARD_TIMEOUT_SECONDS, HEADER_EVENT_STREAM,
-        HEADER_JSON, HTTP_BAD_GATEWAY, HTTP_OK, HTTP_TOO_MANY_REQUESTS,
-        IMAGE_GENERATION_FORWARD_TIMEOUT_SECONDS,
+        response_contains_tool_call_request, rollout_file_date, sanitize_inactive_wait_sse_line,
+        sse_line_is_done, sse_text_has_response_completed, ProviderRoute,
+        CODEX_ROUTER_TOP_MANAGED_END_MARKER, CODEX_ROUTER_TOP_MANAGED_START_MARKER,
+        CUSTOM_IMAGE_GENERATION_UNSUPPORTED_MESSAGE, CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE,
+        FORWARD_TIMEOUT_SECONDS, HEADER_EVENT_STREAM, HEADER_JSON, HTTP_BAD_GATEWAY, HTTP_OK,
+        HTTP_TOO_MANY_REQUESTS, IMAGE_GENERATION_FORWARD_TIMEOUT_SECONDS,
     };
     use std::path::Path;
 
@@ -22497,6 +22616,31 @@ model = "project-model"
             payload["tools"][0]["tools"][0]["parameters"]["properties"]["cell_id"]["enum"],
             serde_json::json!(["live-7"])
         );
+    }
+
+    #[test]
+    fn responses_stream_suppresses_wait_call_when_no_exec_cell_is_active() {
+        let mut suppressed = std::collections::HashSet::new();
+        let added = "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_wait\",\"type\":\"function_call\",\"name\":\"wait\",\"arguments\":\"\"}}\n";
+        let delta = "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_wait\",\"delta\":\"{\\\"cell_id\\\":\\\"noop\\\"}\"}\n";
+        let done = "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_wait\",\"type\":\"function_call\",\"name\":\"wait\",\"arguments\":\"{\\\"cell_id\\\":\\\"noop\\\"}\"}}\n";
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"id\":\"fc_wait\",\"type\":\"function_call\",\"name\":\"wait\",\"arguments\":\"{\\\"cell_id\\\":\\\"noop\\\"}\"},{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[]}]}}\n";
+
+        assert!(sanitize_inactive_wait_sse_line(added, &[], &mut suppressed).is_none());
+        assert!(suppressed.contains("fc_wait"));
+        assert!(sanitize_inactive_wait_sse_line(delta, &[], &mut suppressed).is_none());
+        assert!(sanitize_inactive_wait_sse_line(done, &[], &mut suppressed).is_none());
+        let completed = sanitize_inactive_wait_sse_line(completed, &[], &mut suppressed).unwrap();
+        assert!(!completed.contains(r#""name":"wait""#));
+        assert!(completed.contains(r#""type":"message""#));
+
+        let preserved = sanitize_inactive_wait_sse_line(
+            added,
+            &["real-cell".to_string()],
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap();
+        assert!(preserved.contains(r#""name":"wait""#));
     }
 
     #[test]
