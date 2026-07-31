@@ -148,6 +148,14 @@ function PathSettings({
           onAction={() => setPortDialogOpen(true)}
         />
         <SettingsListRow title="核心文件" description="当前工作目录、配置、Catalog、日志等路径。" actionLabel="查看" onAction={() => setCoreFilesOpen(true)} />
+        <SettingsToggleRow
+          title="Router 调试模式"
+          description="记录脱敏后的客户端请求、最终上游请求和上游响应；默认关闭，仅排查问题时开启。"
+          enabled={appSettings.router_debug_mode || false}
+          onToggle={async (enabled) => {
+            await handleAppSettingsSave({ ...appSettings, router_debug_mode: enabled });
+          }}
+        />
         <TokenAutoRenewRow enabled={appSettings.token_auto_renew_enabled || false} onToggle={async (enabled: boolean) => { await invokeToggleCodexTokenAutoRenew(enabled); await handleAppSettingsSave({ ...appSettings, token_auto_renew_enabled: enabled }); }} />
         <SettingsListRow title="当前版本" value={normalizeDisplayVersion(appSettings.system_version)} valueVariant="plain" valuePlacement="right" />
       </div>
@@ -158,6 +166,47 @@ function PathSettings({
       {portDialogOpen && <PortConfigDialog appSettings={appSettings} handleClose={() => setPortDialogOpen(false)} handleAppSettingsSave={handleAppSettingsSave} />}
       {coreFilesOpen && <CoreFilesDialog localConfigPaths={localConfigPaths} handleClose={() => setCoreFilesOpen(false)} handleLocalFilePreview={handleLocalFilePreview} />}
       {filePreview && <FilePreviewDialog preview={filePreview} handleLocalFilePreviewClose={handleLocalFilePreviewClose} />}
+    </div>
+  );
+}
+
+function SettingsToggleRow({
+  title,
+  description,
+  enabled,
+  onToggle,
+}: {
+  title: string;
+  description: string;
+  enabled: boolean;
+  onToggle: (enabled: boolean) => Promise<void>;
+}) {
+  const [toggling, setToggling] = useState(false);
+  const handleToggle = async () => {
+    setToggling(true);
+    try {
+      await onToggle(!enabled);
+    } finally {
+      setToggling(false);
+    }
+  };
+
+  return (
+    <div className="grid min-h-[68px] items-center gap-3 border-b border-slate-100 px-4 py-3 last:border-b-0 md:grid-cols-[260px_minmax(0,1fr)_auto]">
+      <div className="min-w-0">
+        <div className="text-sm font-semibold text-slate-900">{title}</div>
+        <div className="mt-1 text-xs leading-5 text-slate-500">{description}</div>
+      </div>
+      <div />
+      <button
+        type="button"
+        aria-label={`${enabled ? '关闭' : '打开'}${title}`}
+        disabled={toggling}
+        onClick={handleToggle}
+        className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:opacity-50 ${enabled ? 'bg-indigo-600' : 'bg-slate-300'}`}
+      >
+        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${enabled ? 'translate-x-6' : 'translate-x-1'}`} />
+      </button>
     </div>
   );
 }

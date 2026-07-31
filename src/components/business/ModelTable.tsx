@@ -127,8 +127,8 @@ export function ModelTable({
       <CardHeader className="shrink-0">
         <div className="flex items-center justify-between gap-4">
           <div>
-            <h3 className="text-lg font-bold text-slate-950">{text.title}</h3>
-            <p className="mt-1 text-sm text-slate-500">{text.description}</p>
+            <h3 className="text-lg font-bold text-slate-950">渠道与路由管理</h3>
+            <p className="mt-1 text-sm text-slate-500">管理上游渠道、对外模型映射与负载均衡策略。</p>
           </div>
           <div className="flex flex-wrap justify-end gap-2">
             <Button variant="secondary" onClick={() => runConfigAction('export')} disabled={configBusyAction !== null}>
@@ -137,7 +137,7 @@ export function ModelTable({
             <Button variant="secondary" onClick={() => runConfigAction('import')} disabled={configBusyAction !== null}>
               {configBusyAction === 'import' ? text.importing : text.import}
             </Button>
-            <Button onClick={() => handleModelDialogOpen('create')}>{text.create}</Button>
+            <Button onClick={() => handleModelDialogOpen('create')}>新增渠道</Button>
           </div>
         </div>
       </CardHeader>
@@ -147,9 +147,9 @@ export function ModelTable({
           <table className="w-full table-fixed text-left text-base">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
-                <th className="px-3 py-3" style={{ width: '22%' }}>{text.displayName}</th>
-                <th className="px-3 py-3" style={{ width: '18%' }}>Slug</th>
-                <th className="px-3 py-3" style={{ width: '22%' }}>{text.realModel}</th>
+                <th className="px-3 py-3" style={{ width: '24%' }}>渠道名称</th>
+                <th className="px-3 py-3" style={{ width: '16%' }}>渠道 ID</th>
+                <th className="px-3 py-3" style={{ width: '24%' }}>上游模型与路由</th>
                 <th className="px-3 py-3" style={{ width: '9%' }}>{text.enabledStatus}</th>
                 <th className="px-3 py-3" style={{ width: '29%' }}>{text.actions}</th>
               </tr>
@@ -162,13 +162,15 @@ export function ModelTable({
                   <tr key={model.slug}>
                     <td className="overflow-hidden px-3 py-4">
                       <div className="truncate font-semibold text-slate-900" title={model.displayName}>{model.displayName}</div>
-                      <div className="mt-1 truncate text-xs text-slate-500" title={model.baseUrl}>{model.baseUrl}</div>
+                      <div className="mt-1 flex min-w-0 items-center gap-1"><Badge tone="slate">{model.protocolType}</Badge><span className="truncate text-xs text-slate-500" title={model.baseUrl}>{model.baseUrl}</span></div>
                     </td>
                     <td className="overflow-hidden px-3 py-4">
                       <span className="break-all font-mono text-sm text-slate-700">{model.slug}</span>
                     </td>
                     <td className="overflow-hidden px-3 py-4">
                       <span className="block truncate font-mono text-sm text-slate-700" title={model.realModel}>{model.realModel}</span>
+                      <div className="mt-1 truncate text-xs text-slate-500" title={model.modelMappings.join(', ')}>{model.modelMappings.length ? `对外：${model.modelMappings.join(', ')}` : '对外：渠道 ID'}</div>
+                      <div className="mt-1 text-xs text-slate-500">优先级 {model.priority} · 权重 {model.weight}</div>
                     </td>
                     <td className="px-3 py-4">
                       <div className="flex flex-col items-start gap-2">

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import type { ReactNode } from 'react';
 import { Eye, EyeOff } from 'lucide-react';
 import { Button } from '../ui/Button';
 import type { ModelConfig } from '../../types';
@@ -42,6 +43,9 @@ export function ModelDialog({
     proxyUrl: model?.proxyUrl ?? '',
     protocolType: model?.protocolType ?? DEFAULT_PROTOCOL_TYPE,
     endpointPath: model?.endpointPath ?? resolveDefaultEndpointPath(model?.protocolType ?? DEFAULT_PROTOCOL_TYPE),
+    modelMappings: model?.modelMappings.join(', ') ?? '',
+    priority: String(model?.priority ?? 0),
+    weight: String(model?.weight ?? 1),
     enabled: model?.enabled ?? true,
   });
   const [providerModels, setProviderModels] = useState<string[]>([]);
@@ -112,6 +116,9 @@ export function ModelDialog({
       proxyUrl: formValues.proxyUrl,
       protocolType: formValues.protocolType,
       endpointPath: formValues.endpointPath,
+      modelMappings: parseModelMappings(formValues.modelMappings),
+      priority: parseInteger(formValues.priority, 0),
+      weight: Math.max(1, parseInteger(formValues.weight, 1)),
       enabled: formValues.enabled,
       active: false,
       latency: '-',
@@ -157,17 +164,27 @@ export function ModelDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4 backdrop-blur-sm sm:p-6 lg:p-8">
-      <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-4xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl shadow-slate-950/20 sm:max-h-[calc(100vh-3rem)] lg:max-h-[calc(100vh-4rem)]">
-        <div className="flex shrink-0 items-start justify-between gap-4 border-b border-slate-100 px-5 py-4 sm:px-6 sm:py-5">
+      <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-3xl border border-white/70 bg-slate-50 shadow-2xl shadow-slate-950/20 sm:max-h-[calc(100vh-3rem)] lg:max-h-[calc(100vh-4rem)]">
+        <div className="flex shrink-0 items-start justify-between gap-4 border-b border-slate-200/80 bg-white px-5 py-4 sm:px-7 sm:py-5">
           <h3 className="text-xl font-bold text-slate-950">{isCreateMode ? '新增模型' : '编辑模型'}</h3>
           <Button variant="ghost" onClick={handleModelDialogClose} disabled={saving}>关闭</Button>
         </div>
 
-        <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto px-5 py-5 sm:grid-cols-2 sm:px-6">
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-7 sm:py-6">
+          <div className="mx-auto max-w-4xl">
+            <FormSection title="模型配置" description="按模块配置模型识别、上游连接、路由策略和运行参数。">
           <EditableInput label="显示名称" value={formValues.displayName} onValueChange={(value) => handleFormValueChange('displayName', value)} placeholder="例如：GPT5.5 中转" />
           {!isCreateMode && <ReadonlySlugInput value={formValues.slug} />}
           <EditableInput label="Base URL" value={formValues.baseUrl} onValueChange={(value) => handleFormValueChange('baseUrl', value)} />
           <ProtocolTypeInput value={formValues.protocolType} endpointPath={formValues.endpointPath} onValueChange={handleProtocolTypeChange} onEndpointPathChange={(value) => handleFormValueChange('endpointPath', value)} />
+          <RoutingInput
+            mappings={formValues.modelMappings}
+            priority={formValues.priority}
+            weight={formValues.weight}
+            onMappingsChange={(value) => handleFormValueChange('modelMappings', value)}
+            onPriorityChange={(value) => handleFormValueChange('priority', value)}
+            onWeightChange={(value) => handleFormValueChange('weight', value)}
+          />
           <ApiKeyInput value={formValues.apiKey} visible={apiKeyVisible} onToggleVisible={() => setApiKeyVisible((visible) => !visible)} onValueChange={(value) => handleFormValueChange('apiKey', value)} />
           <ModelInput
             value={formValues.realModel}
@@ -190,9 +207,11 @@ export function ModelDialog({
               <option value="disabled">禁用</option>
             </select>
           </label>
+            </FormSection>
+          </div>
         </div>
 
-        <div className="shrink-0 border-t border-slate-100 bg-slate-50 px-5 py-4 sm:px-6 sm:py-5">
+        <div className="shrink-0 border-t border-slate-200/80 bg-white px-5 py-4 sm:px-7 sm:py-5">
           {saveError && <div className="mb-3 rounded-xl bg-rose-50 px-4 py-3 text-sm leading-6 text-rose-700">{saveError}</div>}
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={handleModelDialogClose} disabled={saving}>取消</Button>
@@ -201,6 +220,20 @@ export function ModelDialog({
         </div>
       </div>
     </div>
+  );
+}
+
+function FormSection({ title, description, children }: { title: string; description: string; children: ReactNode }) {
+  return (
+    <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <div className="border-b border-slate-100 bg-slate-50/70 px-5 py-4 sm:px-6">
+        <h4 className="text-sm font-bold text-slate-900">{title}</h4>
+        <p className="mt-1 text-xs leading-5 text-slate-500">{description}</p>
+      </div>
+      <div className="grid grid-cols-1 gap-x-5 gap-y-4 px-5 py-5 sm:grid-cols-2 sm:px-6">
+        {children}
+      </div>
+    </section>
   );
 }
 
@@ -229,6 +262,26 @@ function ProtocolTypeInput({
         <span className="mb-2 block text-xs font-semibold text-slate-500">Endpoint Path</span>
         <input className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 font-mono text-xs text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" value={endpointPath || selectedProtocol.endpoint} placeholder={selectedProtocol.endpoint} onChange={(event) => onEndpointPathChange(event.target.value)} />
       </label>
+    </fieldset>
+  );
+}
+
+function RoutingInput({ mappings, priority, weight, onMappingsChange, onPriorityChange, onWeightChange }: {
+  mappings: string;
+  priority: string;
+  weight: string;
+  onMappingsChange: (value: string) => void;
+  onPriorityChange: (value: string) => void;
+  onWeightChange: (value: string) => void;
+}) {
+  return (
+    <fieldset className="block sm:col-span-2">
+      <span className="mb-2 block text-sm font-semibold text-slate-700">渠道路由与负载均衡</span>
+      <input className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" value={mappings} placeholder="对外模型名，逗号分隔；相同名称会参与负载均衡" onChange={(event) => onMappingsChange(event.target.value)} />
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <label><span className="mb-1 block text-xs font-semibold text-slate-500">优先级（高者优先）</span><input className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 font-mono text-sm text-slate-700 outline-none" type="number" value={priority} onChange={(event) => onPriorityChange(event.target.value)} /></label>
+        <label><span className="mb-1 block text-xs font-semibold text-slate-500">权重（同优先级）</span><input className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 font-mono text-sm text-slate-700 outline-none" type="number" min="1" value={weight} onChange={(event) => onWeightChange(event.target.value)} /></label>
+      </div>
     </fieldset>
   );
 }
@@ -335,6 +388,15 @@ function clampNumberInput(value: string, max?: number) {
 
 function formatOptionalNumber(value: number | null | undefined, fallback: string) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? String(value) : fallback;
+}
+
+function parseModelMappings(value: string) {
+  return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))];
+}
+
+function parseInteger(value: string, fallback: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : fallback;
 }
 
 export type ModelDialogOpenHandler = (mode: ModelDialogState['mode'], model?: ModelConfig) => void;

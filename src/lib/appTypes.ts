@@ -14,6 +14,9 @@ export type ModelDialogFormValues = {
   proxyUrl: string;
   protocolType: string;
   endpointPath: string;
+  modelMappings: string;
+  priority: string;
+  weight: string;
   enabled: boolean;
 };
 

@@ -10,6 +10,41 @@ pub(crate) enum ProviderProtocol {
     CpaMc,
 }
 
+/// Protocol-specific concerns live behind this interface.  Request/response
+/// conversion remains in the router because it is Codex-format specific,
+/// while endpoint and authentication conventions stay with the provider
+/// adapter.
+pub(crate) trait ProviderAdapter: Send + Sync {
+    fn default_completion_endpoint(&self) -> &'static str;
+    fn apply_authentication(&self, request: ureq::Request, api_key: &str) -> ureq::Request;
+}
+
+struct BearerAdapter(ProviderProtocol);
+struct AnthropicAdapter;
+
+impl ProviderAdapter for BearerAdapter {
+    fn default_completion_endpoint(&self) -> &'static str {
+        match self.0 {
+            ProviderProtocol::OpenAi | ProviderProtocol::Other => CHAT_COMPLETIONS_ENDPOINT_SUFFIX,
+            ProviderProtocol::CpaMc => RESPONSES_ENDPOINT_SUFFIX,
+            ProviderProtocol::Anthropic => unreachable!("Anthropic uses its own adapter"),
+        }
+    }
+
+    fn apply_authentication(&self, request: ureq::Request, api_key: &str) -> ureq::Request {
+        request.set("Authorization", &format!("Bearer {}", api_key))
+    }
+}
+
+impl ProviderAdapter for AnthropicAdapter {
+    fn default_completion_endpoint(&self) -> &'static str { MESSAGES_ENDPOINT_SUFFIX }
+    fn apply_authentication(&self, request: ureq::Request, api_key: &str) -> ureq::Request {
+        request
+            .set("x-api-key", api_key)
+            .set("anthropic-version", "2023-06-01")
+    }
+}
+
 impl ProviderProtocol {
     pub(crate) fn from_config(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -31,10 +66,19 @@ impl ProviderProtocol {
     }
 
     pub(crate) fn default_completion_endpoint(self) -> &'static str {
+        self.adapter().default_completion_endpoint()
+    }
+
+    pub(crate) fn adapter(self) -> &'static dyn ProviderAdapter {
+        static OPENAI: BearerAdapter = BearerAdapter(ProviderProtocol::OpenAi);
+        static OTHER: BearerAdapter = BearerAdapter(ProviderProtocol::Other);
+        static CPAMC: BearerAdapter = BearerAdapter(ProviderProtocol::CpaMc);
+        static ANTHROPIC: AnthropicAdapter = AnthropicAdapter;
         match self {
-            Self::OpenAi | Self::Other => CHAT_COMPLETIONS_ENDPOINT_SUFFIX,
-            Self::Anthropic => MESSAGES_ENDPOINT_SUFFIX,
-            Self::CpaMc => RESPONSES_ENDPOINT_SUFFIX,
+            Self::OpenAi => &OPENAI,
+            Self::Other => &OTHER,
+            Self::Anthropic => &ANTHROPIC,
+            Self::CpaMc => &CPAMC,
         }
     }
 }

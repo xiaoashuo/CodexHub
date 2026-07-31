@@ -340,6 +340,12 @@ export interface ProviderConfigItem {
   proxyUrl?: string;
   protocolType?: string;
   endpointPath?: string;
+  /** Codex-visible model names served by this channel. */
+  modelMappings?: string[];
+  /** Backward-compatible input from configurations saved before the channel refactor. */
+  modelAliases?: string[];
+  priority?: number;
+  weight?: number;
   enabled: boolean;
   active?: boolean;
 }
@@ -551,6 +557,12 @@ export interface ModelConfig {
   proxyUrl: string;
   protocolType: string;
   endpointPath: string;
+  /** Codex-visible model names served by this upstream channel. */
+  modelMappings: string[];
+  /** Higher priority tiers are used before lower priority tiers. */
+  priority: number;
+  /** Smooth weighted round-robin weight within the same priority tier. */
+  weight: number;
   enabled: boolean;
   active: boolean;
   latency: string;

@@ -20,10 +20,13 @@ use tauri::{Emitter, Manager, WindowEvent};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 mod app;
+mod codex_protocol;
 mod constants;
 mod provider_protocol;
+mod router_dispatcher;
 use constants::*;
 use provider_protocol::ProviderProtocol;
+use router_dispatcher::DispatchCandidate;
 
 struct RouterRuntime {
     started_at: Option<Instant>,
@@ -644,6 +647,8 @@ struct AppSettingsInput {
     #[serde(default = "default_oauth_callback_port")]
     oauth_callback_port: u16,
     #[serde(default)]
+    router_debug_mode: bool,
+    #[serde(default)]
     image_generation_compat_mode: bool,
     #[serde(default)]
     account_proxy: AccountProxySettings,
@@ -802,6 +807,13 @@ struct CodexAccountKeyRequest {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CodexAccountExpirationRequest {
+    account_key: String,
+    expires_at: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ChatGptSessionImportRequest {
     session_json: String,
 }
@@ -925,6 +937,12 @@ struct ProviderConfigItemInput {
     protocol_type: String,
     #[serde(rename = "endpointPath", default)]
     endpoint_path: String,
+    #[serde(rename = "modelMappings", alias = "modelAliases", default)]
+    model_mappings: Vec<String>,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_provider_weight")]
+    weight: u32,
     enabled: bool,
     #[serde(default)]
     active: bool,
@@ -1012,6 +1030,8 @@ struct ProviderRoute {
     proxy_url: String,
     protocol_type: String,
     endpoint_path: String,
+    priority: i32,
+    weight: u32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1039,6 +1059,12 @@ struct ProviderRouteFileItem {
     protocol_type: String,
     #[serde(rename = "endpointPath", default)]
     endpoint_path: String,
+    #[serde(rename = "modelMappings", alias = "modelAliases", default)]
+    model_mappings: Vec<String>,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_provider_weight")]
+    weight: u32,
     #[serde(default = "default_provider_enabled")]
     enabled: bool,
     #[serde(default)]
@@ -1066,6 +1092,9 @@ impl From<ProviderConfigItemInput> for ProviderRouteFileItem {
             proxy_url: normalize_proxy_url(&value.proxy_url).unwrap_or_default(),
             protocol_type: normalize_protocol_type(&value.protocol_type),
             endpoint_path: normalize_endpoint_path(&value.endpoint_path),
+            model_mappings: normalize_model_mappings(&value.model_mappings),
+            priority: value.priority,
+            weight: normalize_provider_weight(value.weight),
             enabled: value.enabled,
             active: value.active,
         }
@@ -1078,6 +1107,21 @@ fn default_protocol_type() -> String {
 
 fn default_provider_enabled() -> bool {
     true
+}
+
+fn default_provider_weight() -> u32 { 1 }
+
+fn normalize_provider_weight(weight: u32) -> u32 { weight.max(1) }
+
+fn normalize_model_mappings(mappings: &[String]) -> Vec<String> {
+    let mut normalized = mappings
+        .iter()
+        .map(|alias| alias.trim().to_string())
+        .filter(|alias| !alias.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 fn default_provider_proxy_mode() -> String {
@@ -2951,6 +2995,9 @@ fn read_provider_config() -> Result<ProviderConfigInput, String> {
                 proxy_url: normalize_proxy_url(&route.proxy_url).unwrap_or_default(),
                 protocol_type: normalize_protocol_type(&route.protocol_type),
                 endpoint_path: normalize_endpoint_path(&route.endpoint_path),
+                model_mappings: normalize_model_mappings(&route.model_mappings),
+                priority: route.priority,
+                weight: normalize_provider_weight(route.weight),
                 enabled: route.enabled,
                 active: route.active,
             },
@@ -3627,6 +3674,63 @@ fn remove_codex_account_snapshot(
     Ok(CodexAccountOperationResult {
         message: "已从账号管理中移除该账号快照。".to_string(),
         path: removed_snapshot_path,
+        scan: scan_codex_accounts()?,
+    })
+}
+
+#[tauri::command]
+fn update_codex_account_expiration(
+    request: CodexAccountExpirationRequest,
+) -> Result<CodexAccountOperationResult, String> {
+    let expires_at = request
+        .expires_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let date = OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "到期时间格式无效，请重新选择日期。".to_string())?;
+            date.format(&time::format_description::well_known::Rfc3339)
+                .map_err(|_| "到期时间格式无效，请重新选择日期。".to_string())
+        })
+        .transpose()?;
+
+    let mut registry = read_accounts_registry()?;
+    let root = registry
+        .as_object_mut()
+        .ok_or_else(|| "账号注册表格式无效。".to_string())?;
+    let items = root
+        .get_mut("items")
+        .and_then(|value| value.as_array_mut())
+        .ok_or_else(|| "账号注册表缺少 items。".to_string())?;
+    let item = items
+        .iter_mut()
+        .find(|item| json_string_field(item, "accountKey").as_deref() == Some(&request.account_key))
+        .ok_or_else(|| "未找到要设置到期时间的账号。".to_string())?;
+    let account = item
+        .as_object_mut()
+        .ok_or_else(|| "账号注册表条目格式无效。".to_string())?;
+
+    account.insert(
+        "subscriptionExpiresAt".to_string(),
+        expires_at
+            .as_ref()
+            .map(|value| serde_json::Value::String(value.clone()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    root.insert(
+        "updatedAt".to_string(),
+        serde_json::Value::Number(current_log_time().parse::<i64>().unwrap_or_default().into()),
+    );
+    write_accounts_registry(&registry)?;
+
+    Ok(CodexAccountOperationResult {
+        message: if expires_at.is_some() {
+            "账号到期时间已保存。".to_string()
+        } else {
+            "账号到期时间已清空。".to_string()
+        },
+        path: None,
         scan: scan_codex_accounts()?,
     })
 }
@@ -5384,7 +5488,7 @@ fn write_app_settings(settings: AppSettingsInput) -> Result<AppSettings, String>
             settings.oauth_callback_port,
             default_oauth_callback_port(),
         ),
-        router_debug_mode: false,
+        router_debug_mode: settings.router_debug_mode,
         image_generation_compat_mode: settings.image_generation_compat_mode,
         account_proxy: normalize_account_proxy_settings(
             settings.account_proxy,
@@ -5743,6 +5847,11 @@ fn restart_target_path_patterns(target: &str) -> &'static [&'static str] {
             "*\\OpenAI\\ChatGPT\\*",
             "*\\ChatGPT\\*",
             "*\\OpenAI.ChatGPT_*",
+            // Codex Desktop is distributed as the OpenAI.Codex MSIX package,
+            // even though its visible UI processes are named ChatGPT.exe.
+            // Match the whole package so its codex backend cannot keep the
+            // old Router connection alive and respawn the UI during restart.
+            "*\\OpenAI.Codex_*",
         ]
     }
 }
@@ -5771,10 +5880,6 @@ fn target_process_filter_script(current_pid: u32, target: &str) -> String {
         "$currentPid = {}; Get-Process -ErrorAction SilentlyContinue | Where-Object {{ $_.Id -ne $currentPid -and (({}) -or ($_.Path -ne $null -and ({}))) }}",
         current_pid, name_conditions, path_conditions
     )
-}
-
-fn codex_process_filter_script(current_pid: u32) -> String {
-    target_process_filter_script(current_pid, RESTART_TARGET_CODEX)
 }
 
 fn is_target_process_running(target: &str) -> bool {
@@ -5858,27 +5963,12 @@ fn close_target_process(target: &str) -> Result<(), String> {
 }
 
 fn close_codex_process_for_state_write() -> Result<(), String> {
-    let current_pid = std::process::id();
-    let process_filter = codex_process_filter_script(current_pid);
-    let script = format!(
-        "$processes = @({process_filter}); if ($processes.Count -gt 0) {{ taskkill /IM Codex.exe 2>$null | Out-Null; $deadline = (Get-Date).AddSeconds(8); do {{ Start-Sleep -Milliseconds 250; $processes = @({process_filter}) }} while ($processes.Count -gt 0 -and (Get-Date) -lt $deadline); $processes = @({process_filter}); if ($processes.Count -gt 0) {{ taskkill /F /IM Codex.exe 2>$null | Out-Null; Start-Sleep -Milliseconds 2500 }} }}"
-    );
-    let output = hidden_command("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(format!(
-            "关闭 Codex 失败，无法安全写入新项目侧边栏状态，退出码：{}{}",
-            output
-                .status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "δ֪".to_string()),
-            format_command_error_detail(&output.stderr),
-        )),
-        Err(error) => Err(format!("关闭 Codex 命令执行失败：{}", error)),
-    }
+    close_target_process(RESTART_TARGET_CODEX).map_err(|error| {
+        format!(
+            "{}，无法安全写入新的 Codex 配置和会话状态。",
+            error.trim_end_matches('。')
+        )
+    })
 }
 
 fn close_codex_process_for_state_update_if_running() -> Result<(), String> {
@@ -6296,6 +6386,23 @@ fn stream_custom_responses_request(
             "upstream_body": router_full_debug_body_value(&upstream_body)
         }),
     );
+    append_router_debug_log(
+        "custom_streaming_request",
+        serde_json::json!({
+            "debug_id": full_debug_id,
+            "source_ip": source_ip,
+            "method": request.method,
+            "path": request.path,
+            "target_provider": route.provider.clone(),
+            "protocol_type": protocol_type.clone(),
+            "effective_protocol_type": effective_protocol_type.clone(),
+            "codex_chat_tool_bridge": use_codex_chat_tool_bridge,
+            "upstream_url": upstream_url.clone(),
+            "client_request_body": router_debug_body_value(&String::from_utf8_lossy(&request.body)),
+            "normalized_payload": payload.clone(),
+            "upstream_body": router_debug_body_value(&upstream_body)
+        }),
+    );
     let uses_image_generation_tool = request_uses_image_generation_tool(&payload);
     if uses_image_generation_tool {
         append_router_debug_log(
@@ -6355,24 +6462,23 @@ fn stream_custom_responses_request(
                     && custom_image_generation_response_needs_notice(&body, &content_type);
                 let upstream_empty_text =
                     custom_upstream_response_is_empty_text(&body, &effective_protocol_type);
-                if uses_image_generation_tool || upstream_empty_text {
-                    append_router_debug_log(
-                        "custom_streaming_upstream_response",
-                        serde_json::json!({
-                            "requested_model": payload.get("model").cloned(),
-                            "target_provider": route.provider.clone(),
-                            "protocol_type": effective_protocol_type.clone(),
-                            "status_code": status_code,
-                            "content_type": content_type,
-                            "uses_image_generation_tool": uses_image_generation_tool,
-                            "image_generation_needs_notice": image_generation_needs_notice,
-                            "upstream_empty_text": upstream_empty_text,
-                            "contains_image_generation_result": response_contains_image_generation_result(&body),
-                            "extracted_text": extract_text_for_debug(&body, &content_type, &effective_protocol_type),
-                            "raw_body": router_debug_body_value(&body)
-                        }),
-                    );
-                }
+                append_router_debug_log(
+                    "custom_streaming_upstream_response",
+                    serde_json::json!({
+                        "debug_id": full_debug_id,
+                        "requested_model": payload.get("model").cloned(),
+                        "target_provider": route.provider.clone(),
+                        "protocol_type": effective_protocol_type.clone(),
+                        "status_code": status_code,
+                        "content_type": content_type,
+                        "uses_image_generation_tool": uses_image_generation_tool,
+                        "image_generation_needs_notice": image_generation_needs_notice,
+                        "upstream_empty_text": upstream_empty_text,
+                        "contains_image_generation_result": response_contains_image_generation_result(&body),
+                        "extracted_text": extract_text_for_debug(&body, &content_type, &effective_protocol_type),
+                        "raw_body": router_debug_body_value(&body)
+                    }),
+                );
                 if image_generation_needs_notice {
                     let response = codex_sse_error_response(
                         HTTP_BAD_GATEWAY,
@@ -6557,6 +6663,18 @@ fn stream_custom_responses_request(
         Err(ureq::Error::Status(upstream_status, response)) => {
             status_code = upstream_status;
             let body = response.into_string().unwrap_or_default();
+            append_router_debug_log(
+                "custom_streaming_upstream_status",
+                serde_json::json!({
+                    "debug_id": full_debug_id,
+                    "target_provider": route.provider.clone(),
+                    "protocol_type": protocol_type.clone(),
+                    "effective_protocol_type": effective_protocol_type.clone(),
+                    "status_code": upstream_status,
+                    "upstream_request_body": router_debug_body_value(&upstream_body),
+                    "upstream_response_body": router_debug_body_value(&body)
+                }),
+            );
             append_router_full_debug_log(
                 "custom_streaming_upstream_status",
                 serde_json::json!({
@@ -6567,7 +6685,22 @@ fn stream_custom_responses_request(
                     "upstream_body": router_full_debug_body_value(&body)
                 }),
             );
-            error_detail = format!("upstream status {}", upstream_status);
+            let upstream_message = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(|message| message.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "no structured upstream error message".to_string());
+            error_detail = format!(
+                "upstream status {}: {}; tools=[{}]",
+                upstream_status,
+                truncate_text(&upstream_message, 500),
+                responses_tool_summary_for_log(&payload)
+            );
             let error_code = if upstream_status == HTTP_TOO_MANY_REQUESTS {
                 "upstream_rate_limited"
             } else {
@@ -6756,9 +6889,12 @@ fn stream_official_responses_request(
         }),
     );
     let authorization = format!("Bearer {}", credentials.access_token);
-    let upstream_result =
-        build_official_codex_request(&forward_settings, &authorization, &credentials.account_id)
-            .send_string(&upstream_body);
+    let upstream_result = send_official_codex_request_with_retries(
+        &forward_settings,
+        &authorization,
+        &credentials.account_id,
+        &upstream_body,
+    );
 
     match upstream_result {
         Ok(response) => {
@@ -9604,6 +9740,300 @@ fn build_provider_model_chat_test_request(
 
 fn sanitize_custom_responses_payload(payload: &mut serde_json::Value) {
     remove_responses_input_namespace(payload);
+    normalize_custom_responses_tool_definitions(payload);
+    remove_hosted_image_generation_tool_conflicts(payload);
+}
+
+fn normalize_custom_responses_tool_definitions(payload: &mut serde_json::Value) {
+    fn normalize_containers(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(tools) = object
+                    .get_mut("tools")
+                    .and_then(|tools| tools.as_array_mut())
+                {
+                    normalize_responses_tool_array(tools);
+                }
+                for child in object.values_mut() {
+                    normalize_containers(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    normalize_containers(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    normalize_containers(payload);
+}
+
+fn normalize_responses_tool_array(tools: &mut Vec<serde_json::Value>) {
+    tools.retain_mut(|tool| {
+        normalize_responses_tool_definition(tool);
+        responses_tool_definition_is_valid(tool)
+    });
+}
+
+fn normalize_responses_tool_definition(tool: &mut serde_json::Value) {
+    let Some(object) = tool.as_object_mut() else {
+        return;
+    };
+    let tool_type = object
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if tool_type == "function" && !object.contains_key("name") {
+        if let Some(function) = object
+            .remove("function")
+            .and_then(|function| function.as_object().cloned())
+        {
+            for key in ["name", "description", "parameters", "strict", "namespace"] {
+                if !object.contains_key(key) {
+                    if let Some(value) = function.get(key).cloned() {
+                        object.insert(key.to_string(), value);
+                    }
+                }
+            }
+        }
+    }
+
+    if matches!(tool_type.as_str(), "namespace" | "function" | "custom")
+        && !object.contains_key("name")
+    {
+        let derived_name = ["namespace", "server_label", "serverLabel"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(|value| value.as_str()))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        if let Some(name) = derived_name {
+            object.insert("name".to_string(), serde_json::Value::String(name));
+        }
+    }
+
+    if matches!(tool_type.as_str(), "namespace" | "function" | "custom") {
+        let namespace = object
+            .remove("namespace")
+            .or_else(|| object.remove("server_label"))
+            .or_else(|| object.remove("serverLabel"))
+            .and_then(|value| value.as_str().map(str::to_string))
+            .map(|namespace| namespace.trim().to_string())
+            .filter(|namespace| !namespace.is_empty());
+        if tool_type != "namespace" {
+            if let (Some(namespace), Some(name)) = (
+                namespace,
+                object
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            ) {
+                if !name.starts_with(&format!("{}.", namespace))
+                    && !name.starts_with(&format!("{}__", namespace))
+                {
+                    object.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(format!("{}.{}", namespace, name)),
+                    );
+                }
+            }
+        }
+    }
+
+    if tool_type == "namespace"
+        && !object
+            .get("description")
+            .and_then(|value| value.as_str())
+            .is_some_and(|description| !description.trim().is_empty())
+    {
+        let name = object
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("tools");
+        object.insert(
+            "description".to_string(),
+            serde_json::Value::String(format!("Tools in the {} namespace.", name)),
+        );
+    }
+
+    if let Some(children) = object
+        .get_mut("tools")
+        .and_then(|children| children.as_array_mut())
+    {
+        normalize_responses_tool_array(children);
+    }
+}
+
+fn responses_tool_definition_is_valid(tool: &serde_json::Value) -> bool {
+    let tool_type = tool
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if !matches!(tool_type, "namespace" | "function" | "custom") {
+        return true;
+    }
+    extract_tool_definition_name(tool).is_some()
+}
+
+fn remove_hosted_image_generation_tool_conflicts(payload: &mut serde_json::Value) {
+    fn remove_conflicts_from_tool_array(tools: &mut Vec<serde_json::Value>) -> bool {
+        if !tools.iter().any(is_hosted_image_generation_tool) {
+            return false;
+        }
+
+        let mut removed_conflict = false;
+        tools.retain_mut(|tool| {
+            let namespace = tool_namespace_name(tool).map(str::to_string);
+            if let Some(children) = tool
+                .get_mut("tools")
+                .and_then(|children| children.as_array_mut())
+            {
+                children.retain(|child| {
+                    let conflicts =
+                        is_local_image_generation_tool(child, namespace.as_deref());
+                    removed_conflict |= conflicts;
+                    !conflicts
+                });
+                if children.is_empty() && namespace.as_deref() == Some("image_gen") {
+                    removed_conflict = true;
+                    return false;
+                }
+                if namespace.as_deref() == Some("image_gen") {
+                    return true;
+                }
+            }
+
+            let conflicts = is_local_image_generation_tool(tool, None);
+            removed_conflict |= conflicts;
+            !conflicts
+        });
+        removed_conflict
+    }
+
+    fn remove_conflicts_recursively(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                let removed_conflict = object
+                    .get_mut("tools")
+                    .and_then(|tools| tools.as_array_mut())
+                    .is_some_and(remove_conflicts_from_tool_array);
+
+                if removed_conflict
+                    && object
+                        .get("tool_choice")
+                        .is_some_and(tool_choice_targets_local_image_generation)
+                {
+                    object.insert(
+                        "tool_choice".to_string(),
+                        serde_json::Value::String("auto".to_string()),
+                    );
+                }
+
+                for child in object.values_mut() {
+                    remove_conflicts_recursively(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    remove_conflicts_recursively(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    remove_conflicts_recursively(payload);
+}
+
+fn is_hosted_image_generation_tool(tool: &serde_json::Value) -> bool {
+    let tool_type = tool
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if matches!(tool_type, "image_generation" | "tool_search") {
+        return true;
+    }
+    matches!(tool_type, "hosted" | "hosted_tool")
+        && extract_tool_definition_name(tool) == Some("image_generation")
+}
+
+fn tool_namespace_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("namespace")
+        .or_else(|| tool.get("server_label"))
+        .or_else(|| tool.get("serverLabel"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            (tool.get("type").and_then(|value| value.as_str()) == Some("namespace"))
+                .then(|| {
+                    tool.get("name")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+                .flatten()
+        })
+}
+
+fn is_local_image_generation_tool(
+    tool: &serde_json::Value,
+    parent_namespace: Option<&str>,
+) -> bool {
+    let tool_type = tool
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let name = extract_tool_definition_name(tool).unwrap_or_default();
+    if matches!(name, "image_gen.imagegen" | "image_gen__imagegen") {
+        return true;
+    }
+
+    let namespace = tool_namespace_name(tool).or(parent_namespace);
+    if tool_type == "mcp" && namespace == Some("image_gen") {
+        return true;
+    }
+    if namespace == Some("image_gen") && matches!(name, "imagegen" | "image_gen") {
+        return true;
+    }
+
+    if tool
+        .get("function")
+        .is_some_and(|function| is_local_image_generation_tool(function, namespace))
+    {
+        return true;
+    }
+
+    let serialized = tool.to_string();
+    serialized.contains("\"image_gen.imagegen\"")
+        || serialized.contains("\"image_gen__imagegen\"")
+        || (serialized.contains("\"image_gen\"") && serialized.contains("\"imagegen\""))
+}
+
+fn tool_choice_targets_local_image_generation(tool_choice: &serde_json::Value) -> bool {
+    match tool_choice {
+        serde_json::Value::String(name) => {
+            matches!(
+                name.as_str(),
+                "imagegen" | "image_gen.imagegen" | "image_gen__imagegen"
+            )
+        }
+        serde_json::Value::Object(object) => {
+            is_local_image_generation_tool(tool_choice, None)
+                || extract_tool_definition_name(tool_choice) == Some("imagegen")
+                || object
+                    .values()
+                    .any(tool_choice_targets_local_image_generation)
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().any(tool_choice_targets_local_image_generation)
+        }
+        _ => false,
+    }
 }
 
 fn remove_responses_input_namespace(payload: &mut serde_json::Value) {
@@ -9637,23 +10067,13 @@ fn remove_json_key_recursive(value: &mut serde_json::Value, key: &str) {
 }
 
 fn build_openai_chat_body(payload: &serde_json::Value, route: &ProviderRoute) -> serde_json::Value {
-    let mut body = serde_json::Map::new();
+    let mut body = codex_protocol::responses_to_openai(payload, &route.real_model);
     let active_exec_cell_ids = collect_active_exec_cell_ids(payload);
     let uses_codex_custom_tool_bridge = request_has_codex_custom_tools(payload);
-    body.insert(
-        "model".to_string(),
-        serde_json::Value::String(route.real_model.clone()),
-    );
-    body.insert(
-        "messages".to_string(),
-        serde_json::Value::Array(extract_chat_messages(payload, false)),
-    );
-    body.insert("stream".to_string(), serde_json::Value::Bool(false));
+    let object = body.as_object_mut().expect("protocol bridge returns an object");
+    object.insert("stream".to_string(), serde_json::Value::Bool(false));
 
-    if let Some(mut tools) = payload
-        .get("tools")
-        .and_then(convert_responses_tools_to_chat_tools)
-    {
+    if let Some(mut tools) = object.get("tools").and_then(|value| value.as_array()).cloned() {
         tools.retain(|tool| {
             chat_function_tool_name(tool) != Some("wait") || !active_exec_cell_ids.is_empty()
         });
@@ -9662,34 +10082,27 @@ fn build_openai_chat_body(payload: &serde_json::Value, route: &ProviderRoute) ->
                 constrain_chat_wait_tool(tool, &active_exec_cell_ids);
             }
         }
-        body.insert("tools".to_string(), serde_json::Value::Array(tools));
-    }
-
-    if let Some(tool_choice) = payload.get("tool_choice") {
-        body.insert(
-            "tool_choice".to_string(),
-            convert_responses_tool_choice_to_chat(tool_choice),
-        );
+        object.insert("tools".to_string(), serde_json::Value::Array(tools));
     }
 
     if uses_codex_custom_tool_bridge {
-        body.insert(
+        object.insert(
             "parallel_tool_calls".to_string(),
             serde_json::Value::Bool(false),
         );
     } else if let Some(parallel_tool_calls) = payload.get("parallel_tool_calls").cloned() {
-        body.insert("parallel_tool_calls".to_string(), parallel_tool_calls);
+        object.insert("parallel_tool_calls".to_string(), parallel_tool_calls);
     }
 
     if let Some(temperature) = payload.get(OFFICIAL_TEMPERATURE_KEY).cloned() {
-        body.insert("temperature".to_string(), temperature);
+        object.insert("temperature".to_string(), temperature);
     }
 
     if let Some(max_tokens) = payload.get(OFFICIAL_MAX_OUTPUT_TOKENS_KEY).cloned() {
-        body.insert("max_tokens".to_string(), max_tokens);
+        object.insert("max_tokens".to_string(), max_tokens);
     }
 
-    serde_json::Value::Object(body)
+    body
 }
 
 fn chat_function_tool_name(tool: &serde_json::Value) -> Option<&str> {
@@ -9771,6 +10184,14 @@ fn collect_active_exec_cell_ids(payload: &serde_json::Value) -> Vec<String> {
             .unwrap_or_default();
         match item_type {
             "function_call" | "custom_tool_call" => {
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if name != "wait" {
+                    active.clear();
+                }
                 let Some(call_id) = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
@@ -9778,11 +10199,6 @@ fn collect_active_exec_cell_ids(payload: &serde_json::Value) -> Vec<String> {
                 else {
                     continue;
                 };
-                let name = item
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
                 let cell_id = item
                     .get("arguments")
                     .and_then(|arguments| arguments.as_str())
@@ -9800,6 +10216,7 @@ fn collect_active_exec_cell_ids(payload: &serde_json::Value) -> Vec<String> {
                 }
                 active.extend(extract_running_exec_cell_ids(&output));
             }
+            "message" => active.clear(),
             _ => {}
         }
     }
@@ -10166,6 +10583,7 @@ fn merge_function_calls_into_assistant(
     }))
 }
 
+#[allow(dead_code)]
 fn convert_responses_tools_to_chat_tools(
     value: &serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
@@ -10240,6 +10658,7 @@ fn collect_namespace_tool_mappings(payload: &serde_json::Value) -> Vec<Namespace
     mappings
 }
 
+#[allow(dead_code)]
 fn convert_responses_namespace_tool_to_chat_tools(
     tool: &serde_json::Value,
 ) -> Vec<serde_json::Value> {
@@ -10295,6 +10714,7 @@ fn convert_responses_namespace_tool_to_chat_tools(
         .collect()
 }
 
+#[allow(dead_code)]
 fn convert_responses_tool_to_chat_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
     let tool_type = tool
         .get("type")
@@ -10355,6 +10775,7 @@ fn convert_responses_tool_to_chat_tool(tool: &serde_json::Value) -> Option<serde
     }))
 }
 
+#[allow(dead_code)]
 fn convert_responses_tool_choice_to_chat(tool_choice: &serde_json::Value) -> serde_json::Value {
     let choice_type = tool_choice.get("type").and_then(|value| value.as_str());
     if choice_type == Some("custom") || choice_type == Some("function") {
@@ -11518,6 +11939,13 @@ fn normalize_upstream_tool_name(raw_name: &str, available_tool_names: &[String])
         return name.to_string();
     }
 
+    if let Some(candidate) = available_tool_names
+        .iter()
+        .find(|candidate| candidate.trim().replace('.', "__") == name)
+    {
+        return candidate.trim().to_string();
+    }
+
     for candidate in available_tool_names {
         let candidate = candidate.trim();
         if candidate.is_empty() || candidate == name || name.len() % candidate.len() != 0 {
@@ -11645,9 +12073,12 @@ fn forward_official_codex_responses_request(mut payload: serde_json::Value) -> R
         }
     };
     let authorization = format!("Bearer {}", credentials.access_token);
-    let upstream_result =
-        build_official_codex_request(&forward_settings, &authorization, &credentials.account_id)
-            .send_string(&upstream_body);
+    let upstream_result = send_official_codex_request_with_retries(
+        &forward_settings,
+        &authorization,
+        &credentials.account_id,
+        &upstream_body,
+    );
 
     match upstream_result {
         Ok(response) => {
@@ -11714,6 +12145,30 @@ fn build_official_codex_request(
     .set(HEADER_CHATGPT_ACCOUNT_ID, account_id)
     .set(HEADER_OPENAI_BETA, OFFICIAL_CODEX_BETA_HEADER_VALUE)
     .set(HEADER_ORIGINATOR, OFFICIAL_CODEX_ORIGINATOR)
+}
+
+fn send_official_codex_request_with_retries(
+    settings: &OfficialCodexForwardSettings,
+    authorization: &str,
+    account_id: &str,
+    body: &str,
+) -> Result<ureq::Response, ureq::Error> {
+    let mut last_error = None;
+    for attempt in 0..UPSTREAM_NETWORK_RETRY_ATTEMPTS {
+        match build_official_codex_request(settings, authorization, account_id).send_string(body) {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if attempt + 1 < UPSTREAM_NETWORK_RETRY_ATTEMPTS
+                    && upstream_error_is_retryable(&error) =>
+            {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(UPSTREAM_NETWORK_RETRY_DELAY_MS));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.expect("official retry loop should store the last upstream error"))
 }
 
 fn load_official_codex_forward_settings() -> OfficialCodexForwardSettings {
@@ -12311,6 +12766,7 @@ fn write_codex_stream_disconnect_error(
     stream: &mut TcpStream,
     reason: &str,
 ) -> std::io::Result<()> {
+    stream.write_all(b"\n\n")?;
     write_codex_stream_error(
         stream,
         "upstream_stream_disconnected",
@@ -12516,9 +12972,6 @@ fn sanitize_inactive_wait_sse_line(
     active_exec_cell_ids: &[String],
     suppressed_item_ids: &mut HashSet<String>,
 ) -> Option<String> {
-    if !active_exec_cell_ids.is_empty() {
-        return Some(line.to_string());
-    }
     let leading_len = line.len() - line.trim_start().len();
     let leading = &line[..leading_len];
     let trimmed = &line[leading_len..];
@@ -12548,7 +13001,10 @@ fn sanitize_inactive_wait_sse_line(
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             let is_suppressed = suppressed_item_ids.contains(item_id);
-            if is_wait_tool_call_item(item) || is_suppressed {
+            if (is_wait_tool_call_item(item)
+                && !wait_tool_call_is_valid(item, active_exec_cell_ids))
+                || is_suppressed
+            {
                 if !item_id.is_empty() {
                     suppressed_item_ids.insert(item_id.to_string());
                 }
@@ -12579,7 +13035,9 @@ fn sanitize_inactive_wait_sse_line(
             .and_then(|response| response.get_mut("output"))
             .and_then(|output| output.as_array_mut())
         {
-            output.retain(|item| !is_wait_tool_call_item(item));
+            output.retain(|item| {
+                !is_wait_tool_call_item(item) || wait_tool_call_is_valid(item, active_exec_cell_ids)
+            });
         }
     }
 
@@ -12593,6 +13051,36 @@ fn sanitize_inactive_wait_sse_line(
     serde_json::to_string(&event)
         .ok()
         .map(|event| format!("{}data: {}{}", leading, event, line_ending))
+}
+
+fn wait_tool_call_cell_id(item: &serde_json::Value) -> Option<String> {
+    let arguments = item.get("arguments").or_else(|| item.get("input"))?;
+    let arguments = match arguments {
+        serde_json::Value::String(arguments) => {
+            serde_json::from_str::<serde_json::Value>(arguments).ok()?
+        }
+        serde_json::Value::Object(_) => arguments.clone(),
+        _ => return None,
+    };
+    arguments
+        .get("cell_id")
+        .and_then(|cell_id| cell_id.as_str())
+        .map(str::trim)
+        .filter(|cell_id| !cell_id.is_empty())
+        .map(str::to_string)
+}
+
+fn wait_tool_call_is_valid(item: &serde_json::Value, active_exec_cell_ids: &[String]) -> bool {
+    wait_tool_call_cell_id(item)
+        .is_some_and(|cell_id| active_exec_cell_ids.iter().any(|active| active == &cell_id))
+}
+
+fn sse_data_value(line: &str) -> Option<serde_json::Value> {
+    let data = line.trim_start().strip_prefix("data:")?.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(data).ok()
 }
 
 fn is_wait_tool_call_item(item: &serde_json::Value) -> bool {
@@ -12647,9 +13135,22 @@ fn stream_raw_upstream_sse(
     let mut saw_done = false;
     let mut pending_event_line: Option<String> = None;
     let mut suppressed_wait_item_ids = HashSet::<String>::new();
+    let mut pending_wait_item_id: Option<String> = None;
+    let mut pending_wait_sse = String::new();
     loop {
         let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                if saw_completed {
+                    stream.write_all(b"\n\ndata: [DONE]\n\n")?;
+                    stream.flush()?;
+                } else {
+                    write_codex_stream_disconnect_error(stream, &error.to_string())?;
+                }
+                return Err(error);
+            }
+        };
         if bytes_read == 0 {
             break;
         }
@@ -12675,6 +13176,103 @@ fn stream_raw_upstream_sse(
         }
         let line =
             normalize_repeated_tool_names_in_sse_line_with_available(&line, available_tool_names);
+        let event = sse_data_value(&line);
+        let event_line = pending_event_line.take();
+
+        if let Some(wait_item_id) = pending_wait_item_id.clone() {
+            let current_event_line = event_line.clone();
+            if let Some(event_line) = event_line {
+                pending_wait_sse.push_str(&event_line);
+            }
+            pending_wait_sse.push_str(&line);
+
+            let wait_resolution =
+                event.as_ref().and_then(|event| {
+                    let event_type = event.get("type").and_then(|value| value.as_str())?;
+                    if event_type == "response.output_item.done" {
+                        let item = event.get("item")?;
+                        let item_id = item
+                            .get("id")
+                            .or_else(|| item.get("call_id"))
+                            .and_then(|value| value.as_str())?;
+                        (item_id == wait_item_id)
+                            .then(|| wait_tool_call_is_valid(item, active_exec_cell_ids))
+                    } else if event_type == "response.completed" {
+                        let item = event
+                            .get("response")
+                            .and_then(|response| response.get("output"))
+                            .and_then(|output| output.as_array())
+                            .and_then(|output| {
+                                output.iter().find(|item| {
+                                    item.get("id")
+                                        .or_else(|| item.get("call_id"))
+                                        .and_then(|value| value.as_str())
+                                        == Some(wait_item_id.as_str())
+                                })
+                            });
+                        Some(item.is_some_and(|item| {
+                            wait_tool_call_is_valid(item, active_exec_cell_ids)
+                        }))
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(is_valid) = wait_resolution {
+                if is_valid {
+                    stream.write_all(pending_wait_sse.as_bytes())?;
+                    stream.flush()?;
+                } else {
+                    suppressed_wait_item_ids.insert(wait_item_id);
+                    append_router_debug_log(
+                        "inactive_wait_tool_call_suppressed",
+                        serde_json::json!({
+                            "active_exec_cell_ids": active_exec_cell_ids,
+                            "suppressed_item_ids": suppressed_wait_item_ids
+                        }),
+                    );
+                    if event.as_ref().and_then(|event| event.get("type"))
+                        == Some(&serde_json::Value::String("response.completed".to_string()))
+                    {
+                        if let Some(completed) = sanitize_inactive_wait_sse_line(
+                            &line,
+                            active_exec_cell_ids,
+                            &mut suppressed_wait_item_ids,
+                        ) {
+                            if let Some(event_line) = current_event_line {
+                                stream.write_all(event_line.as_bytes())?;
+                            }
+                            stream.write_all(completed.as_bytes())?;
+                            stream.flush()?;
+                        }
+                    }
+                }
+                pending_wait_item_id = None;
+                pending_wait_sse.clear();
+            }
+            continue;
+        }
+
+        let added_wait_item_id = event.as_ref().and_then(|event| {
+            (event.get("type").and_then(|value| value.as_str())
+                == Some("response.output_item.added"))
+            .then_some(())?;
+            let item = event.get("item")?;
+            is_wait_tool_call_item(item).then_some(())?;
+            item.get("id")
+                .or_else(|| item.get("call_id"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+        if let Some(item_id) = added_wait_item_id {
+            if let Some(event_line) = event_line {
+                pending_wait_sse.push_str(&event_line);
+            }
+            pending_wait_sse.push_str(&line);
+            pending_wait_item_id = Some(item_id);
+            continue;
+        }
+
         let Some(line) = sanitize_inactive_wait_sse_line(
             &line,
             active_exec_cell_ids,
@@ -12687,7 +13285,6 @@ fn stream_raw_upstream_sse(
                     "suppressed_item_ids": suppressed_wait_item_ids
                 }),
             );
-            pending_event_line = None;
             continue;
         };
         append_router_full_debug_log(
@@ -12698,24 +13295,25 @@ fn stream_raw_upstream_sse(
                 "line": router_full_debug_sse_line_value(&line)
             }),
         );
-        if let Some(event_line) = pending_event_line.take() {
+        if let Some(event_line) = event_line {
             stream.write_all(event_line.as_bytes())?;
         }
         stream.write_all(line.as_bytes())?;
         stream.flush()?;
     }
     if !saw_completed {
-        let completion = ensure_official_sse_completed(String::new());
+        let reason = "upstream stream closed before response.completed";
         append_router_full_debug_log(
-            "router_sse_completion_fallback",
+            "router_sse_incomplete",
             serde_json::json!({
                 "debug_id": full_debug_id,
                 "saw_completed": saw_completed,
                 "saw_done": saw_done,
-                "body": router_full_debug_body_value(&completion)
+                "reason": reason
             }),
         );
-        stream.write_all(completion.as_bytes())?;
+        write_codex_stream_disconnect_error(stream, reason)?;
+        return Err(std::io::Error::new(ErrorKind::UnexpectedEof, reason));
     } else {
         append_router_full_debug_log(
             "router_sse_done_fallback",
@@ -12745,7 +13343,18 @@ fn stream_official_codex_sse(
 
     loop {
         let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                if saw_completed {
+                    stream.write_all(b"\n\ndata: [DONE]\n\n")?;
+                    stream.flush()?;
+                } else {
+                    write_codex_stream_disconnect_error(stream, &error.to_string())?;
+                }
+                return Err(error);
+            }
+        };
         if bytes_read == 0 {
             break;
         }
@@ -12792,17 +13401,18 @@ fn stream_official_codex_sse(
     }
 
     if !saw_completed {
-        let completion = ensure_official_sse_completed(String::new());
+        let reason = "official upstream stream closed before response.completed";
         append_router_full_debug_log(
-            "official_sse_completion_fallback",
+            "official_sse_incomplete",
             serde_json::json!({
                 "debug_id": full_debug_id,
                 "saw_completed": saw_completed,
                 "saw_done": saw_done,
-                "body": router_full_debug_body_value(&completion)
+                "reason": reason
             }),
         );
-        stream.write_all(completion.as_bytes())?;
+        write_codex_stream_disconnect_error(stream, reason)?;
+        return Err(std::io::Error::new(ErrorKind::UnexpectedEof, reason));
     } else {
         append_router_full_debug_log(
             "official_sse_done_fallback",
@@ -16152,6 +16762,62 @@ fn thread_session_state_needs_repair(
     }
 
     false
+}
+
+fn responses_tool_summary_for_log(payload: &serde_json::Value) -> String {
+    fn summarize(tool: &serde_json::Value, parent: Option<&str>) -> String {
+        if let Some(name) = tool.as_str() {
+            return format!("string:{}", truncate_text(name, 80));
+        }
+        let tool_type = tool
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let name = extract_tool_definition_name(tool).unwrap_or("-");
+        let namespace = tool_namespace_name(tool).or(parent).unwrap_or("-");
+        let children = tool
+            .get("tools")
+            .or_else(|| tool.get("functions"))
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .take(20)
+                    .map(|item| summarize(item, Some(namespace)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        if children.is_empty() {
+            format!(
+                "type={},name={},namespace={}",
+                truncate_text(tool_type, 40),
+                truncate_text(name, 80),
+                truncate_text(namespace, 80)
+            )
+        } else {
+            format!(
+                "type={},name={},namespace={},children=[{}]",
+                truncate_text(tool_type, 40),
+                truncate_text(name, 80),
+                truncate_text(namespace, 80),
+                children
+            )
+        }
+    }
+
+    payload
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .take(50)
+                .map(|tool| summarize(tool, None))
+                .collect::<Vec<_>>()
+                .join(";")
+        })
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn session_updated_at_unix_seconds(session: &ThreadSession) -> Option<i64> {
@@ -20930,6 +21596,12 @@ fn append_router_log_entry(log_entry: &RouterLogEntry) -> Result<(), String> {
 }
 
 fn append_router_debug_log(reason: &str, detail: serde_json::Value) {
+    if !load_app_settings()
+        .map(|settings| settings.router_debug_mode)
+        .unwrap_or(false)
+    {
+        return;
+    }
     let entry = serde_json::json!({
         "time": current_log_time(),
         "reason": reason,
@@ -21517,21 +22189,45 @@ fn select_provider_route_by_slug(
     config: &RouterProviderConfig,
     model: &str,
 ) -> Option<ProviderRoute> {
-    if let Some(route_value) = config.0.get(model) {
-        let route_item =
-            serde_json::from_value::<ProviderRouteFileItem>(route_value.clone()).ok()?;
-        return provider_route_from_item(model, route_item);
-    }
+    select_provider_routes_by_model(config, model).into_iter().next()
+}
+
+/// Builds a priority-aware weighted route queue.  A model is routed by slug,
+/// display name, or an explicit `modelMappings` entry.  This keeps legacy
+/// single-model configuration working while allowing multiple provider
+/// entries to serve the same Codex model.
+fn select_provider_routes_by_model(
+    config: &RouterProviderConfig,
+    model: &str,
+) -> Vec<ProviderRoute> {
+    let model = model.trim();
+    let mut routes = HashMap::new();
+    let mut candidates = Vec::new();
 
     for (slug, route_value) in &config.0 {
-        let route_item =
-            serde_json::from_value::<ProviderRouteFileItem>(route_value.clone()).ok()?;
-        if route_item.display_name.trim() == model {
-            return provider_route_from_item(slug, route_item);
+        let Ok(route_item) = serde_json::from_value::<ProviderRouteFileItem>(route_value.clone()) else {
+            continue;
+        };
+        let matches = slug == model
+            || route_item.display_name.trim() == model
+            || route_item.model_mappings.iter().any(|mapping| mapping.trim() == model);
+        if !matches {
+            continue;
+        }
+        if let Some(route) = provider_route_from_item(slug, route_item) {
+            candidates.push(DispatchCandidate {
+                key: slug.clone(),
+                priority: route.priority,
+                weight: route.weight,
+            });
+            routes.insert(slug.clone(), route);
         }
     }
 
-    None
+    router_dispatcher::order_candidates(model, candidates)
+        .into_iter()
+        .filter_map(|candidate| routes.remove(&candidate.key))
+        .collect()
 }
 
 fn provider_route_from_item(
@@ -21566,6 +22262,8 @@ fn provider_route_from_item(
         proxy_mode: normalize_provider_proxy_mode(&route_item.proxy_mode),
         protocol_type: normalize_protocol_type(&route_item.protocol_type),
         endpoint_path: normalize_endpoint_path(&route_item.endpoint_path),
+        priority: route_item.priority,
+        weight: normalize_provider_weight(route_item.weight),
     })
 }
 
@@ -21655,16 +22353,15 @@ fn build_custom_upstream_post_request(
     authorization: &str,
     timeout_seconds: u64,
 ) -> ureq::Request {
-    let request = build_upstream_post_request(url, proxy_url, timeout_seconds)
-        .set(HEADER_CONTENT_TYPE, HEADER_JSON);
-
-    if is_anthropic_protocol(protocol_type) {
-        request
-            .set(HEADER_ANTHROPIC_API_KEY, api_key)
-            .set(HEADER_ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE)
-    } else {
-        request.set(HEADER_AUTHORIZATION, authorization)
-    }
+    let _ = authorization; // Kept in the signature for existing call sites.
+    let protocol = ProviderProtocol::from_config(protocol_type);
+    protocol
+        .adapter()
+        .apply_authentication(
+            build_upstream_post_request(url, proxy_url, timeout_seconds)
+                .set(HEADER_CONTENT_TYPE, HEADER_JSON),
+            api_key,
+        )
 }
 
 fn send_custom_upstream_request_with_retries(
@@ -22088,21 +22785,26 @@ pub use app::{run, run_router_only};
 mod tests {
     use super::{
         active_rollout_path, build_openai_chat_body, codex_completed_sse_from_text,
-        codex_sse_error_response, codex_sse_transport_status_code, collect_namespace_tool_mappings,
-        custom_empty_response_is_image_generation_unsupported,
+        codex_sse_error_response, codex_sse_transport_status_code, collect_active_exec_cell_ids,
+        collect_namespace_tool_mappings, custom_empty_response_is_image_generation_unsupported,
         custom_image_generation_response_needs_notice, custom_upstream_timeout_seconds,
-        ensure_official_sse_completed, guard_wait_tool_for_upstream,
+        ensure_official_sse_completed, extract_tool_definition_name, guard_wait_tool_for_upstream,
+        is_hosted_image_generation_tool,
         normalize_official_codex_payload, normalize_repeated_tool_names_in_body,
         normalize_repeated_tool_names_in_body_with_available,
-        normalize_repeated_tool_names_in_sse_line, openai_chat_sse_body_to_codex_sse,
+        normalize_repeated_tool_names_in_sse_line, normalize_upstream_tool_name,
+        openai_chat_sse_body_to_codex_sse,
         openai_chat_tool_calls_to_codex_sse, remove_codex_router_top_level_keys,
         remove_managed_codex_router_block, request_uses_image_generation_tool,
-        response_contains_tool_call_request, rollout_file_date, sanitize_inactive_wait_sse_line,
-        sse_line_is_done, sse_text_has_response_completed, ProviderRoute,
-        CODEX_ROUTER_TOP_MANAGED_END_MARKER, CODEX_ROUTER_TOP_MANAGED_START_MARKER,
-        CUSTOM_IMAGE_GENERATION_UNSUPPORTED_MESSAGE, CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE,
-        FORWARD_TIMEOUT_SECONDS, HEADER_EVENT_STREAM, HEADER_JSON, HTTP_BAD_GATEWAY, HTTP_OK,
-        HTTP_TOO_MANY_REQUESTS, IMAGE_GENERATION_FORWARD_TIMEOUT_SECONDS,
+        response_contains_tool_call_request, rollout_file_date, sanitize_custom_responses_payload,
+        sanitize_inactive_wait_sse_line, sse_line_is_done, sse_text_has_response_completed,
+        stream_raw_upstream_sse, target_process_filter_script, wait_tool_call_is_valid,
+        ProviderRoute,
+        CODEX_ROUTER_TOP_MANAGED_END_MARKER,
+        CODEX_ROUTER_TOP_MANAGED_START_MARKER, CUSTOM_IMAGE_GENERATION_UNSUPPORTED_MESSAGE,
+        CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE, FORWARD_TIMEOUT_SECONDS, HEADER_EVENT_STREAM,
+        HEADER_JSON, HTTP_BAD_GATEWAY, HTTP_OK, HTTP_TOO_MANY_REQUESTS,
+        IMAGE_GENERATION_FORWARD_TIMEOUT_SECONDS,
     };
     use std::path::Path;
 
@@ -22204,6 +22906,58 @@ model = "project-model"
             .contains(CUSTOM_UPSTREAM_EMPTY_RESPONSE_MESSAGE));
         assert!(response.body.ends_with("data: [DONE]\n\n"));
         assert!(response.error_detail.contains("upstream_empty_response"));
+    }
+
+    #[test]
+    fn raw_upstream_read_error_terminates_client_sse() {
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let (mut socket, _) = upstream_listener.accept().unwrap();
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n\r\n",
+                "100\r\n",
+                "data: {\"type\":\"response.created\"}\n\n"
+            );
+            std::io::Write::write_all(&mut socket, response.as_bytes()).unwrap();
+            std::io::Write::flush(&mut socket).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let downstream_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let downstream_address = downstream_listener.local_addr().unwrap();
+        let mut downstream_client = std::net::TcpStream::connect(downstream_address).unwrap();
+        downstream_client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (mut downstream_server, _) = downstream_listener.accept().unwrap();
+
+        let response = ureq::get(&format!("http://{upstream_address}"))
+            .call()
+            .unwrap();
+        let result =
+            stream_raw_upstream_sse(response, &mut downstream_server, None, &[], &[]);
+        assert!(result.is_err());
+        drop(downstream_server);
+        upstream.join().unwrap();
+
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut downstream_client, &mut body).unwrap();
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("\"code\":\"upstream_stream_disconnected\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn chatgpt_restart_filter_includes_codex_desktop_package_processes() {
+        let script = target_process_filter_script(1234, "chatgpt");
+        assert!(script.contains("$_.Name -ieq 'ChatGPT'"));
+        assert!(script.contains("$_.Path -like '*\\OpenAI.Codex_*'"));
+        assert!(script.contains("$_.Id -ne $currentPid"));
     }
 
     #[test]
@@ -22394,6 +23148,8 @@ model = "project-model"
             proxy_url: String::new(),
             protocol_type: "openai".to_string(),
             endpoint_path: "/chat/completions".to_string(),
+            priority: 0,
+            weight: 1,
         };
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":null}\n\n",
@@ -22445,6 +23201,8 @@ model = "project-model"
             proxy_url: String::new(),
             protocol_type: "openai".to_string(),
             endpoint_path: "/chat/completions".to_string(),
+            priority: 0,
+            weight: 1,
         };
         let payload = serde_json::json!({
             "input": [{"role": "user", "content": "run a command"}],
@@ -22474,6 +23232,8 @@ model = "project-model"
             proxy_url: String::new(),
             protocol_type: "openai".to_string(),
             endpoint_path: "/chat/completions".to_string(),
+            priority: 0,
+            weight: 1,
         };
         let mut payload = serde_json::json!({
             "input": [{"role": "user", "content": "run a command"}],
@@ -22633,14 +23393,56 @@ model = "project-model"
         let completed = sanitize_inactive_wait_sse_line(completed, &[], &mut suppressed).unwrap();
         assert!(!completed.contains(r#""name":"wait""#));
         assert!(completed.contains(r#""type":"message""#));
+    }
 
-        let preserved = sanitize_inactive_wait_sse_line(
-            added,
-            &["real-cell".to_string()],
-            &mut std::collections::HashSet::new(),
-        )
-        .unwrap();
-        assert!(preserved.contains(r#""name":"wait""#));
+    #[test]
+    fn wait_tool_call_requires_an_exact_active_cell_id() {
+        let active = ["27".to_string()];
+        for cell_id in ["noop", "none", "none2", "", "28"] {
+            let item = serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                "arguments": serde_json::json!({"cell_id": cell_id}).to_string()
+            });
+            assert!(!wait_tool_call_is_valid(&item, &active), "{cell_id}");
+        }
+        let valid_string = serde_json::json!({
+            "type": "function_call",
+            "name": "wait",
+            "arguments": "{\"cell_id\":\"27\"}"
+        });
+        let valid_object = serde_json::json!({
+            "type": "custom_tool_call",
+            "namespace": "wait",
+            "input": {"cell_id": "27"}
+        });
+        assert!(wait_tool_call_is_valid(&valid_string, &active));
+        assert!(wait_tool_call_is_valid(&valid_object, &active));
+    }
+
+    #[test]
+    fn stale_running_exec_cells_are_cleared_by_later_activity() {
+        for later_item in [
+            serde_json::json!({"type": "message", "role": "assistant", "content": []}),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "exec",
+                "call_id": "call_later",
+                "arguments": "{}"
+            }),
+        ] {
+            let payload = serde_json::json!({
+                "input": [
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_old",
+                        "output": "Script running with cell ID 1"
+                    },
+                    later_item
+                ]
+            });
+            assert!(collect_active_exec_cell_ids(&payload).is_empty());
+        }
     }
 
     #[test]
@@ -22654,6 +23456,8 @@ model = "project-model"
             proxy_url: String::new(),
             protocol_type: "openai".to_string(),
             endpoint_path: "/chat/completions".to_string(),
+            priority: 0,
+            weight: 1,
         };
         let payload = serde_json::json!({
             "input": [{"role": "user", "content": "send"}],
@@ -22742,6 +23546,8 @@ model = "project-model"
             proxy_url: String::new(),
             protocol_type: "openai".to_string(),
             endpoint_path: "/chat/completions".to_string(),
+            priority: 0,
+            weight: 1,
         };
         let payload = serde_json::json!({
             "input": [{
@@ -22950,6 +23756,224 @@ model = "project-model"
     }
 
     #[test]
+    fn responses_payload_prefers_hosted_image_generation_over_conflicting_namespace_tool() {
+        let mut payload = serde_json::json!({
+            "tools": [
+                {"type": "image_generation"},
+                {
+                    "type": "namespace",
+                    "name": "image_gen",
+                    "tools": [
+                        {"type": "function", "name": "imagegen", "parameters": {}},
+                        {"type": "function", "name": "inspect", "parameters": {}}
+                    ]
+                },
+                {"type": "function", "name": "unrelated", "parameters": {}}
+            ],
+            "tool_choice": {
+                "type": "function",
+                "namespace": "image_gen",
+                "name": "imagegen"
+            }
+        });
+
+        sanitize_custom_responses_payload(&mut payload);
+
+        let tools = payload["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| {
+            tool.get("type").and_then(|value| value.as_str()) == Some("image_generation")
+        }));
+        let image_namespace = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(|value| value.as_str()) == Some("image_gen"))
+            .unwrap();
+        let children = image_namespace["tools"].as_array().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["name"], "inspect");
+        assert!(tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(|value| value.as_str()) == Some("unrelated")));
+        assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn responses_payload_keeps_local_image_tool_without_hosted_tool() {
+        let mut payload = serde_json::json!({
+            "tools": [{
+                "type": "namespace",
+                "name": "image_gen",
+                "tools": [{"type": "function", "name": "imagegen", "parameters": {}}]
+            }]
+        });
+
+        sanitize_custom_responses_payload(&mut payload);
+
+        assert_eq!(payload["tools"][0]["name"], "image_gen");
+        assert_eq!(payload["tools"][0]["tools"][0]["name"], "imagegen");
+        assert_eq!(
+            payload["tools"][0]["description"],
+            "Tools in the image_gen namespace."
+        );
+    }
+
+    #[test]
+    fn responses_payload_removes_nested_image_namespace_when_tool_search_is_present() {
+        let mut payload = serde_json::json!({
+            "input": [{
+                "role": "user",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "image_gen",
+                        "tools": [{
+                            "type": "function",
+                            "name": "imagegen",
+                            "parameters": {}
+                        }]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "unrelated",
+                        "tools": [{
+                            "type": "function",
+                            "name": "inspect",
+                            "parameters": {}
+                        }]
+                    },
+                    {"type": "tool_search"}
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "namespace": "image_gen",
+                    "name": "imagegen"
+                }
+            }]
+        });
+
+        sanitize_custom_responses_payload(&mut payload);
+
+        let tools = payload["input"][0]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|tool| {
+            tool.get("type").and_then(|value| value.as_str()) == Some("tool_search")
+        }));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(|value| value.as_str()) == Some("unrelated")));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(|value| value.as_str()) == Some("image_gen")));
+        assert_eq!(payload["input"][0]["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn responses_payload_removes_flattened_image_tool_schema_variants() {
+        let mut payload = serde_json::json!({
+            "tools": [
+                {"type": "image_generation"},
+                {"type": "function", "namespace": "image_gen", "name": "imagegen"},
+                {"type": "function", "server_label": "image_gen", "name": "imagegen"},
+                {
+                    "type": "function",
+                    "function": {"namespace": "image_gen", "name": "imagegen"}
+                },
+                {"type": "function", "name": "image_gen.imagegen"},
+                {"type": "function", "name": "unrelated"}
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"namespace": "image_gen", "name": "imagegen"}
+            }
+        });
+
+        sanitize_custom_responses_payload(&mut payload);
+
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(is_hosted_image_generation_tool));
+        assert!(tools
+            .iter()
+            .any(|tool| extract_tool_definition_name(tool) == Some("unrelated")));
+        assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn responses_payload_removes_image_gen_mcp_when_hosted_image_tool_exists() {
+        let mut payload = serde_json::json!({
+            "tools": [
+                {"type": "image_generation"},
+                {
+                    "type": "mcp",
+                    "server_label": "image_gen",
+                    "server_url": "https://example.test/mcp",
+                    "allowed_tools": ["imagegen"]
+                },
+                {
+                    "type": "mcp",
+                    "server_label": "unrelated",
+                    "server_url": "https://example.test/other"
+                }
+            ]
+        });
+
+        sanitize_custom_responses_payload(&mut payload);
+
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(is_hosted_image_generation_tool));
+        assert!(tools.iter().any(|tool| {
+            tool.get("server_label").and_then(|value| value.as_str()) == Some("unrelated")
+        }));
+        assert!(!tools.iter().any(|tool| {
+            tool.get("server_label").and_then(|value| value.as_str()) == Some("image_gen")
+        }));
+    }
+
+    #[test]
+    fn responses_payload_adds_required_names_to_codex_tool_variants() {
+        let mut payload = serde_json::json!({
+            "tools": [
+                {"type": "image_generation"},
+                {
+                    "type": "namespace",
+                    "namespace": "functions",
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "shell_command",
+                            "description": "Run a command",
+                            "parameters": {"type": "object", "properties": {}}
+                        }
+                    }]
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "standalone",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                },
+                {"type": "function", "description": "invalid without a name"}
+            ]
+        });
+
+        sanitize_custom_responses_payload(&mut payload);
+
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[1]["name"], "functions");
+        assert!(tools[1].get("namespace").is_none());
+        assert_eq!(
+            tools[1]["description"],
+            "Tools in the functions namespace."
+        );
+        assert_eq!(tools[1]["tools"][0]["name"], "shell_command");
+        assert!(tools[1]["tools"][0].get("function").is_none());
+        assert_eq!(tools[2]["name"], "standalone");
+        assert!(tools[2].get("function").is_none());
+    }
+
+    #[test]
     fn duplicated_upstream_tool_name_is_normalized_even_when_tool_list_missing() {
         let body = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"execexec","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
         let root = serde_json::from_str::<serde_json::Value>(body).unwrap();
@@ -22957,6 +23981,15 @@ model = "project-model"
 
         assert!(converted.contains(r#""name":"exec""#));
         assert!(!converted.contains(r#""name":"execexec""#));
+    }
+
+    #[test]
+    fn chat_tool_alias_maps_back_to_dotted_codex_name() {
+        let available = ["image_gen.imagegen".to_string()];
+        assert_eq!(
+            normalize_upstream_tool_name("image_gen__imagegen", &available),
+            "image_gen.imagegen"
+        );
     }
 
     #[test]
@@ -22970,6 +24003,8 @@ model = "project-model"
             proxy_url: String::new(),
             protocol_type: "openai".to_string(),
             endpoint_path: "/chat/completions".to_string(),
+            priority: 0,
+            weight: 1,
         };
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"waitwait\",\"arguments\":\"{\\\"timeout_ms\\\":\"}}]}}]}\n\n",
@@ -22996,6 +24031,8 @@ model = "project-model"
             proxy_url: String::new(),
             protocol_type: "openai".to_string(),
             endpoint_path: "/chat/completions".to_string(),
+            priority: 0,
+            weight: 1,
         };
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"waitwait\",\"arguments\":\"{\\\"timeout_ms\\\":\"}}]}}]}\n\n",

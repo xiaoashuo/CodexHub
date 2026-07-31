@@ -67,6 +67,7 @@ pnpm-debug.log*
 ### Local debugging artifacts
 .playwright-cli/
 .reference-*/
+docs/refrences/waliapi/
 debug-*.cjs
 debug-*.png
 debug*.log

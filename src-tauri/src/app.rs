@@ -117,6 +117,7 @@ pub fn run() {
             scan_codex_accounts,
             switch_codex_account,
             remove_codex_account_snapshot,
+            update_codex_account_expiration,
             export_codex_accounts,
             refresh_codex_accounts_usage,
             refresh_codex_account_usage,
