@@ -29,20 +29,19 @@ export interface RouterCommandProgressState {
 }
 
 export interface RouterStartupPreparationResult {
+  router_mode: number;
   codex_config_path: string;
   catalog_path: string;
   provider_config_path: string;
   sync_catalog_result: SyncCatalogResult;
   port_occupancy: PortOccupancyInfo;
   killed_port_owner: boolean;
-  thread_restore_restored_count: number;
-  thread_restore_skipped_count: number;
-  thread_restore_message: string;
-  codex_restart_attempted: boolean;
-  codex_restart_message: string;
 }
 
-export type CodexRestartMode = 'restart' | 'skip';
+export interface CatalogModelOption {
+  value: string;
+  label: string;
+}
 
 export interface LocalConfigPaths {
   user_home_path: string;
@@ -50,8 +49,37 @@ export interface LocalConfigPaths {
   catalog_path: string;
   provider_config_path: string;
   app_settings_path: string;
+  router_config_path: string;
   app_log_path: string;
   router_debug_log_path: string;
+}
+
+export interface RouterCommonConfig {
+  router_name: string;
+  base_url: string;
+  auth_method: 'native' | 'external' | 'env';
+  auth_external_token: string;
+  auth_env_key: string;
+  model_catalog_json: string;
+  default_model: string;
+}
+
+export interface RouterSystemConfig extends RouterCommonConfig {
+  router_port: number;
+  concurrency_limit: number;
+}
+
+export type RouterExternalConfig = RouterCommonConfig;
+
+export interface RouterRuntimeConfig {
+  router_mode: number;
+  restart: number;
+}
+
+export interface RouterConfig {
+  system_config: RouterSystemConfig;
+  external_config: RouterExternalConfig;
+  runtime: RouterRuntimeConfig;
 }
 
 export type McpTransport = 'stdio' | 'http' | 'sse';
@@ -420,6 +448,15 @@ export interface AppSettings {
   router_debug_mode: boolean;
   image_generation_compat_mode: boolean;
   account_proxy: AccountProxySettings;
+  router_name: string;
+  router_base_url: string;
+  router_auth_method: 'native' | 'external' | 'env';
+  router_auth_external_token: string;
+  router_auth_env_key: string;
+  router_model_catalog_json: string;
+  router_default_model: string;
+  router_mode: 'system' | 'third';
+  router_auto_restart: boolean;
 }
 
 export interface SyncCatalogResult {

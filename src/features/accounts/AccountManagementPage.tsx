@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Calendar, RefreshCw } from 'lucide-react';
 import { Badge } from '../../components/ui/Badge';
 import { invokeImportCpaAccount } from '../../lib/tauriBridge';
@@ -34,7 +34,7 @@ let cachedScanResult: CodexAccountScanResult | null = null;
 let cachedSelectedAccountId = '';
 let initialScanPromise: Promise<CodexAccountScanResult> | null = null;
 
-type LoginTab = 'web' | 'client' | 'cpa' | 'web_seesion';
+type LoginTab = 'web' | 'client' | 'cpa';
 type LoginStatus = 'idle' | 'waiting' | 'success' | 'error';
 type SwitchStepStatus = 'pending' | 'running' | 'success' | 'error';
 type OAuthCallbackListenerStatus = {
@@ -368,9 +368,9 @@ export function AccountManagementPage({ appSettings }: { appSettings: AppSetting
       applyScanResult(result.scan, selectedAccount.accountKey);
       setOperationMessage('');
       showToast(result.message || '额度刷新成功');
-    } catch {
+    } catch (usageError) {
       setUsageFailedAccountKey(selectedAccount.accountKey);
-      showToast('额度刷新异常，详细信息请查看应用日志', 'error');
+      showToast(formatUnknownError(usageError), 'error');
     } finally {
       setUsageLoading(false);
     }
@@ -402,7 +402,7 @@ export function AccountManagementPage({ appSettings }: { appSettings: AppSetting
     setError('');
 
     try {
-      const result = await invokeUpdateCodexAccountExpiration(account.accountKey, expiresAt);
+      const result = await invokeUpdateCodexAccountExpiration(account.accountKey, account.email, expiresAt);
       applyScanResult(result.scan, account.accountKey);
       setOperationMessage('');
       showToast(result.message || '账号到期时间已保存');
@@ -1051,9 +1051,6 @@ function AccountLoginDialog({
             <button className={`rounded-md px-4 py-2 text-sm font-semibold ${activeTab === 'cpa' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`} onClick={() => onTabChange('cpa')}>
               CPA 登录
             </button>
-            <button className={`rounded-md px-4 py-2 text-sm font-semibold ${activeTab === 'web_seesion' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`} onClick={() => onTabChange('web_seesion')}>
-              web_seesion 登录
-            </button>
           </div>
         </div>
 
@@ -1090,7 +1087,7 @@ function AccountLoginDialog({
                 </>
               )}
             </>
-          ) : activeTab === 'cpa' ? (
+          ) : (
             <>
               {!cpaLoginStarted ? (
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
@@ -1113,33 +1110,6 @@ function AccountLoginDialog({
                   </div>
                 </>
               )}
-            </>
-          ) : (
-            <>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
-                <div className="text-sm font-semibold text-slate-900">web_seesion 登录流程</div>
-                <div className="mt-3 grid gap-2">
-                  <LoginStep index={1} title="登录 ChatGPT 官网" active={loginStatus === 'idle'} done={sessionLoginStarted || loginStatus === 'success'} />
-                  <LoginStep index={2} title="访问 https://chatgpt.com/api/auth/session" active={sessionLoginStarted && loginStatus !== 'success'} done={loginStatus === 'success'} />
-                  <LoginStep index={3} title="将结果粘贴到输入框，建议包含 sessionToken 或 cookie 字段" active={Boolean(sessionJson.trim()) && loginStatus !== 'success'} done={loginStatus === 'success'} />
-                  <LoginStep index={4} title="点击开始登录" active={loginStatus === 'waiting'} done={loginStatus === 'success'} />
-                </div>
-              </div>
-              <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="flex flex-wrap gap-2">
-                  <Button variant="secondary" onClick={onSessionStart} disabled={busy}>打开 ChatGPT 官网</Button>
-                  <Button variant="secondary" onClick={onOpenSessionUrl} disabled={busy}>打开 Session 接口</Button>
-                  <Button onClick={onSessionSuccess} disabled={busy}>{busy ? '保存中' : '开始登录'}</Button>
-                  <Button variant="secondary" onClick={onSessionClear} disabled={busy || !sessionJson}>清空</Button>
-                  <Button variant="secondary" onClick={onSessionFail} disabled={busy}>重置状态</Button>
-                </div>
-                <textarea
-                  className="min-h-44 w-full resize-y rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-700 outline-none focus:border-indigo-400"
-                  onChange={(event) => onSessionJsonChange(event.target.value)}
-                  placeholder="粘贴 https://chatgpt.com/api/auth/session 返回的 JSON；若 JSON 不含 sessionToken，可额外包含 cookie 字段用于后续刷新 Token"
-                  value={sessionJson}
-                />
-              </div>
             </>
           )}
 

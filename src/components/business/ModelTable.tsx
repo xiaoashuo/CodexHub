@@ -1,5 +1,5 @@
 import { useState, type ButtonHTMLAttributes, type MouseEvent } from 'react';
-import { MoreHorizontal, Network, Pause, Pencil, Play, Settings2, Star, Trash2, type LucideIcon } from 'lucide-react';
+import { Check, Copy, MoreHorizontal, Network, Pause, Pencil, Play, Settings2, Star, Trash2, type LucideIcon } from 'lucide-react';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { Card, CardHeader } from '../ui/Card';
@@ -72,6 +72,19 @@ export function ModelTable({
   const [proxyDialogModel, setProxyDialogModel] = useState<ModelConfig | null>(null);
   const [actionMenuSlug, setActionMenuSlug] = useState<string | null>(null);
   const [actionMenuPosition, setActionMenuPosition] = useState<ActionMenuPosition | null>(null);
+  const [copiedAddressSlug, setCopiedAddressSlug] = useState<string | null>(null);
+
+  const handleCopyAddress = async (slug: string, address: string) => {
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopiedAddressSlug(slug);
+      window.setTimeout(() => {
+        setCopiedAddressSlug((current) => (current === slug ? null : current));
+      }, 1200);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
 
   const runConnectivityTest = async (model: ModelConfig) => {
     if (!model.enabled || model.status === 'testing' || testingActionBySlug[model.slug]) return;
@@ -106,7 +119,7 @@ export function ModelTable({
     setActionMenuPosition(null);
   };
 
-  const toggleActionMenu = (event: MouseEvent<HTMLButtonElement>, model: ModelConfig, opensUp: boolean) => {
+  const toggleActionMenu = (event: MouseEvent<HTMLButtonElement>, model: ModelConfig) => {
     if (actionMenuSlug === model.slug) {
       closeActionMenu();
       return;
@@ -115,6 +128,7 @@ export function ModelTable({
     const rect = event.currentTarget.getBoundingClientRect();
     const menuHeight = 88;
     const gap = 6;
+    const opensUp = rect.bottom > window.innerHeight - menuHeight - gap;
     setActionMenuPosition({
       top: opensUp ? Math.max(gap, rect.top - menuHeight - gap) : rect.bottom + gap,
       right: Math.max(gap, window.innerWidth - rect.right),
@@ -128,7 +142,7 @@ export function ModelTable({
         <div className="flex items-center justify-between gap-4">
           <div>
             <h3 className="text-lg font-bold text-slate-950">渠道与路由管理</h3>
-            <p className="mt-1 text-sm text-slate-500">管理上游渠道、对外模型映射与负载均衡策略。</p>
+            <p className="mt-1 text-sm text-slate-500">管理上游渠道、协议类型与对外模型映射。</p>
           </div>
           <div className="flex flex-wrap justify-end gap-2">
             <Button variant="secondary" onClick={() => runConfigAction('export')} disabled={configBusyAction !== null}>
@@ -142,77 +156,78 @@ export function ModelTable({
         </div>
       </CardHeader>
 
-      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-5 pr-4" onScroll={closeActionMenu}>
-        <div className="min-w-0 overflow-hidden rounded-2xl border border-slate-200">
-          <table className="w-full table-fixed text-left text-base">
-            <thead className="bg-slate-50 text-slate-500">
-              <tr>
-                <th className="px-3 py-3" style={{ width: '24%' }}>渠道名称</th>
-                <th className="px-3 py-3" style={{ width: '16%' }}>渠道 ID</th>
-                <th className="px-3 py-3" style={{ width: '24%' }}>上游模型与路由</th>
-                <th className="px-3 py-3" style={{ width: '9%' }}>{text.enabledStatus}</th>
-                <th className="px-3 py-3" style={{ width: '29%' }}>{text.actions}</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 bg-white">
-              {models.map((model, index) => {
-                const testDisabled = !model.enabled || model.status === 'testing' || testingActionBySlug[model.slug];
-                const menuOpensUp = index >= models.length - 2;
-                return (
-                  <tr key={model.slug}>
-                    <td className="overflow-hidden px-3 py-4">
-                      <div className="truncate font-semibold text-slate-900" title={model.displayName}>{model.displayName}</div>
-                      <div className="mt-1 flex min-w-0 items-center gap-1"><Badge tone="slate">{model.protocolType}</Badge><span className="truncate text-xs text-slate-500" title={model.baseUrl}>{model.baseUrl}</span></div>
-                    </td>
-                    <td className="overflow-hidden px-3 py-4">
-                      <span className="break-all font-mono text-sm text-slate-700">{model.slug}</span>
-                    </td>
-                    <td className="overflow-hidden px-3 py-4">
-                      <span className="block truncate font-mono text-sm text-slate-700" title={model.realModel}>{model.realModel}</span>
-                      <div className="mt-1 truncate text-xs text-slate-500" title={model.modelMappings.join(', ')}>{model.modelMappings.length ? `对外：${model.modelMappings.join(', ')}` : '对外：渠道 ID'}</div>
-                      <div className="mt-1 text-xs text-slate-500">优先级 {model.priority} · 权重 {model.weight}</div>
-                    </td>
-                    <td className="px-3 py-4">
-                      <div className="flex flex-col items-start gap-2">
-                        <Badge tone={model.enabled ? 'green' : 'slate'}>{model.enabled ? text.enabled : text.disabled}</Badge>
-                        {model.active && <Badge tone="blue">{text.current}</Badge>}
-                      </div>
-                    </td>
-                    <td className="px-3 py-4">
-                      <div className="flex flex-nowrap items-center gap-1">
-                        <IconButton label={text.setCurrent} icon="star" onClick={() => handleModelSetActive(model)} disabled={!model.enabled || model.active} />
-                        <IconButton label={model.enabled ? text.connectivityTest : text.disabledTest} icon="network" loading={testingActionBySlug[model.slug]} onClick={() => runConnectivityTest(model)} disabled={testDisabled} />
-                        <IconButton label={model.enabled ? text.disable : text.enable} icon={model.enabled ? 'pause' : 'play'} onClick={() => handleModelEnabledToggle(model)} />
-                        {!compact && <IconButton label={text.edit} icon="edit" variant="ghost" onClick={() => handleModelDialogOpen('edit', model)} />}
-                        <div className="relative">
-                          <IconButton label={text.moreActions} icon="more" onClick={(event) => toggleActionMenu(event, model, menuOpensUp)} />
-                          {actionMenuSlug === model.slug && <div className="fixed inset-0 z-10" onClick={closeActionMenu} />}
-                          {actionMenuSlug === model.slug && actionMenuPosition && (
-                            <div className="fixed z-20 w-36 rounded-xl border border-slate-200 bg-white py-1 shadow-lg" style={{ top: actionMenuPosition.top, right: actionMenuPosition.right }}>
-                              <button className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50" onClick={() => { closeActionMenu(); setProxyDialogModel(model); }}>
-                                <Settings2 size={16} className="text-slate-400" />
-                                <span>{text.proxyConfig}</span>
-                              </button>
-                              <button className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50" onClick={() => { closeActionMenu(); handleModelDelete(model); }}>
-                                <Trash2 size={16} className="text-rose-500" />
-                                <span>{text.delete}</span>
-                              </button>
-                            </div>
-                          )}
+      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5" onScroll={closeActionMenu}>
+        {models.length === 0 ? (
+          <div className="flex min-h-[40vh] items-center justify-center rounded-2xl border border-dashed border-slate-200 bg-slate-50 text-sm text-slate-400">
+            {text.empty}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {models.map((model) => {
+              const testDisabled = !model.enabled || model.status === 'testing' || testingActionBySlug[model.slug];
+              return (
+                <div key={model.slug} className="flex flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-base font-semibold text-slate-900" title={model.displayName}>{model.displayName}</div>
+                    </div>
+                    <div className="flex shrink-0 flex-row items-center gap-2">
+                      {model.active && (
+                        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-amber-50 text-amber-500" title={text.current} aria-label={text.current}>
+                          <Star size={13} fill="currentColor" />
+                        </span>
+                      )}
+                      <Badge tone={model.enabled ? 'green' : 'slate'}>{model.enabled ? text.enabled : text.disabled}</Badge>
+                    </div>
+                  </div>
+
+                  <dl className="mt-3 space-y-1.5 text-sm">
+                    <div className="flex items-start gap-2">
+                      <dt className="w-16 shrink-0 text-xs text-slate-400">地址</dt>
+                      <dd className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <span className="min-w-0 flex-1 truncate font-mono text-slate-700" title={model.baseUrl}>{model.baseUrl}</span>
+                        <button type="button" className="shrink-0 rounded-md p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600" title={copiedAddressSlug === model.slug ? '已复制' : '复制地址'} aria-label="复制地址" onClick={() => handleCopyAddress(model.slug, model.baseUrl)}>
+                          {copiedAddressSlug === model.slug ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
+                        </button>
+                      </dd>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <dt className="w-16 shrink-0 text-xs text-slate-400">渠道 ID</dt>
+                      <dd className="min-w-0 break-all font-mono text-slate-700">{model.slug}</dd>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <dt className="w-16 shrink-0 text-xs text-slate-400">上游模型</dt>
+                      <dd className="min-w-0 break-all font-mono text-slate-700" title={model.realModel}>{model.realModel}</dd>
+                    </div>
+                  </dl>
+
+                  <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3">
+                    <IconButton label={text.setCurrent} icon="star" onClick={() => handleModelSetActive(model)} disabled={!model.enabled || model.active} />
+                    <IconButton label={model.enabled ? text.connectivityTest : text.disabledTest} icon="network" loading={testingActionBySlug[model.slug]} onClick={() => runConnectivityTest(model)} disabled={testDisabled} />
+                    <IconButton label={model.enabled ? text.disable : text.enable} icon={model.enabled ? 'pause' : 'play'} onClick={() => handleModelEnabledToggle(model)} />
+                    {!compact && <IconButton label={text.edit} icon="edit" variant="ghost" onClick={() => handleModelDialogOpen('edit', model)} />}
+                    <div className="relative">
+                      <IconButton label={text.moreActions} icon="more" onClick={(event) => toggleActionMenu(event, model)} />
+                      {actionMenuSlug === model.slug && <div className="fixed inset-0 z-10" onClick={closeActionMenu} />}
+                      {actionMenuSlug === model.slug && actionMenuPosition && (
+                        <div className="fixed z-20 w-36 rounded-xl border border-slate-200 bg-white py-1 shadow-lg" style={{ top: actionMenuPosition.top, right: actionMenuPosition.right }}>
+                          <button className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50" onClick={() => { closeActionMenu(); setProxyDialogModel(model); }}>
+                            <Settings2 size={16} className="text-slate-400" />
+                            <span>{text.proxyConfig}</span>
+                          </button>
+                          <button className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50" onClick={() => { closeActionMenu(); handleModelDelete(model); }}>
+                            <Trash2 size={16} className="text-rose-500" />
+                            <span>{text.delete}</span>
+                          </button>
                         </div>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-              {models.length === 0 && (
-                <tr>
-                  <td className="px-4 py-10 text-center text-sm text-slate-400" colSpan={5}>{text.empty}</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {proxyDialogModel && (

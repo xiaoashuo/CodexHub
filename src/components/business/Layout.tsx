@@ -2,9 +2,12 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { invokeOpenExternalUrl } from '../../lib/tauriBridge';
-import type { CodexRestartMode, RouterStatus } from '../../types';
+import type { RouterStatus } from '../../types';
+import type { RouterConfig } from '../../types';
+import { ROUTER_HOST, ROUTER_PORT } from '../../lib/constants';
 import type { NavItem } from '../../data/seedData';
 import type { MouseEvent } from 'react';
+import { Server, SlidersHorizontal } from 'lucide-react';
 
 const GITHUB_REPOSITORY_URL = 'https://github.com/xiaoashuo/CodexHub';
 
@@ -70,7 +73,7 @@ export function TitleBar({ checkingVersion, handleVersionCheck }: { checkingVers
   );
 }
 
-export function Header({ routerStatus, routerActionRunning, handleRouterToggle }: { routerStatus: RouterStatus; routerActionRunning: boolean; handleRouterToggle: (codexRestartMode?: CodexRestartMode) => Promise<void> }) {
+export function Header({ routerStatus, routerActionRunning, handleRouterToggle }: { routerStatus: RouterStatus; routerActionRunning: boolean; handleRouterToggle: () => Promise<void> }) {
   const actionText = routerStatus === 'running' ? '停止 Router' : '启动 Router';
 
   return (
@@ -90,7 +93,7 @@ export function Header({ routerStatus, routerActionRunning, handleRouterToggle }
   );
 }
 
-export function Sidebar({ activeNav, navItems, setActiveNav }: { activeNav: NavItem; navItems: readonly NavItem[]; setActiveNav: (nav: NavItem) => void }) {
+export function Sidebar({ activeNav, navItems, setActiveNav, routerStatus, routerConfig }: { activeNav: NavItem; navItems: readonly NavItem[]; setActiveNav: (nav: NavItem) => void; routerStatus: RouterStatus; routerConfig: RouterConfig }) {
   return (
     <aside className="w-72 shrink-0 border-r border-white/70 bg-white/75 px-5 py-6 shadow-xl shadow-indigo-100/40 backdrop-blur">
       <div className="mb-8 rounded-3xl bg-slate-950 p-5 text-white shadow-lg">
@@ -101,9 +104,9 @@ export function Sidebar({ activeNav, navItems, setActiveNav }: { activeNav: NavI
           </div>
           <div className="min-w-0 flex-1">
             <h1 className="mt-1 truncate text-2xl font-bold">Codex伴侣</h1>
+            <p className="mt-2 text-sm leading-5 text-slate-300">ChatGPT桌面控制台。</p>
           </div>
         </div>
-        <p className="mt-4 text-sm leading-6 text-slate-300">Codex 本地工作流的桌面控制台。</p>
       </div>
       <nav className="space-y-1">
         {navItems.map((item) => (
@@ -118,6 +121,65 @@ export function Sidebar({ activeNav, navItems, setActiveNav }: { activeNav: NavI
           </button>
         ))}
       </nav>
+      <SidebarServiceStatus routerStatus={routerStatus} routerConfig={routerConfig} onNavigateToRouter={() => setActiveNav('路由管理')} />
     </aside>
+  );
+}
+
+function SidebarServiceStatus({ routerStatus, routerConfig, onNavigateToRouter }: { routerStatus: RouterStatus; routerConfig: RouterConfig; onNavigateToRouter: () => void }) {
+  const isSystem = routerConfig.runtime.router_mode === 0;
+  const systemBaseUrl = `http://${ROUTER_HOST}:${routerConfig.system_config.router_port || ROUTER_PORT}/v1`;
+  const baseUrl = isSystem ? systemBaseUrl : routerConfig.external_config.base_url;
+  const running = routerStatus === 'running';
+  const modeLabel = isSystem ? '系统路由' : '三方路由';
+
+  return (
+    <section
+      className="group mt-5 cursor-pointer overflow-hidden rounded-2xl border border-indigo-100 bg-gradient-to-br from-white to-indigo-50/70 p-4 shadow-sm transition hover:border-indigo-200 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-indigo-300"
+      role="button"
+      tabIndex={0}
+      onClick={onNavigateToRouter}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onNavigateToRouter();
+        }
+      }}
+      aria-label="查看路由管理"
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className={`relative flex h-2.5 w-2.5 items-center justify-center`}>
+            {running && (
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+            )}
+            <span className={`relative inline-flex h-2.5 w-2.5 rounded-full ${running ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+          </div>
+          <span className="text-sm font-semibold text-slate-700">服务状态</span>
+        </div>
+        <span
+          className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+            running ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-500'
+          }`}
+        >
+          {running ? '运行中' : '已停止'}
+        </span>
+      </div>
+
+      <div className="mt-3 flex items-center gap-2 text-xs font-medium text-slate-500">
+        <SlidersHorizontal size={14} strokeWidth={1.8} className="text-indigo-400" />
+        <span>{modeLabel}</span>
+        <span className="text-slate-300">·</span>
+        <span>{running ? '本地服务已就绪' : '尚未启动路由'}</span>
+      </div>
+
+      <div className="mt-3 flex items-center gap-2.5 rounded-xl border border-slate-200/80 bg-white px-3 py-2.5 shadow-sm">
+        <Server size={18} strokeWidth={1.8} className={`shrink-0 ${running ? 'text-emerald-500' : 'text-slate-400'}`} />
+        <div className="min-w-0">
+          <div className="text-[11px] font-medium text-slate-400">API BaseUrl 地址</div>
+          <div className="mt-0.5 break-all font-mono text-xs leading-relaxed text-slate-800">{baseUrl || '未配置 Base URL'}</div>
+        </div>
+      </div>
+    </section>
   );
 }

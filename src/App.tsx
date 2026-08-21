@@ -1,21 +1,19 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
-import { Header, Sidebar, TitleBar } from './components/business/Layout';
+import { Sidebar, TitleBar } from './components/business/Layout';
 import { ModelDialog } from './components/business/ModelDialog';
 import { Button } from './components/ui/Button';
 import { navItems, type NavItem } from './data/seedData';
 import { AccountManagementPage } from './features/accounts/AccountManagementPage';
 import { DashboardPage } from './features/dashboard/DashboardPage';
-import { MaintenanceToolsPage } from './features/maintenance/MaintenanceToolsPage';
-import { McpManagementPage } from './features/mcp/McpManagementPage';
+import { LogsPage } from './features/logs/LogsPage';
 import { ModelsPage } from './features/models/ModelsPage';
 import { RouterCommandProgressDialog, RouterPage, RouterStartupChecklistDialog } from './features/router/RouterPage';
 import { SettingsPage } from './features/settings/SettingsPage';
-import { SkillsManagementPage } from './features/skills/SkillsManagementPage';
+import { ServicesPage } from './features/services/ServicesPage';
 import { ThreadManagerPage } from './features/threads/ThreadManagerPage';
 import { APP_VERSION, ROUTER_BASE_PATH, ROUTER_HEALTH_URL, ROUTER_HOST, ROUTER_PORT } from './lib/constants';
-import { DEFAULT_ROUTER_START_CODEX_RESTART_MODE } from './lib/routerDefaults';
 import {
   invokeClearAppLogs,
   invokeClearRouterRequestLogs,
@@ -30,24 +28,29 @@ import {
   invokePreviewLocalFile,
   invokeQuickCodexThreadSummary,
   invokeReadAppSettings,
+  invokeReadCatalogModelOptions,
+  invokeReadRouterConfig,
   invokeReadProviderConfig,
   invokeRestartCodexApp,
   invokePrepareRouterStartup,
+  invokePortOccupancyCheck,
   invokeRouterCommand,
   invokeRouterRequestLogs,
   invokeSearchAppLogs,
   invokeSyncEnabledModelsToCatalog,
+  invokeSyncOfficialCatalog,
   invokeTestProviderModel,
   invokeTestProviderModelChat,
   invokeTokenUsageSummary,
   invokeWriteAppSettings,
+  invokeWriteRouterConfig,
   invokeWriteProviderConfig,
   ROUTER_COMMANDS,
 } from './lib/tauriBridge';
 import type {
   AppOperationLogEntry,
   AppSettings,
-  CodexRestartMode,
+  CatalogModelOption,
   FilePreviewResult,
   LatestVersionCheckResult,
   LocalConfigPaths,
@@ -59,6 +62,7 @@ import type {
   RouterStartupChecklistState,
   RouterStartupChecklistStep,
   RouterStatus,
+  RouterConfig,
   SyncCatalogResult,
   ToastState,
   UpdateDownloadProgress,
@@ -69,16 +73,14 @@ const DASHBOARD_REFRESH_INTERVAL_MS = 60_000;
 const DASHBOARD_INITIAL_REFRESH_DELAY_MS = 1_500;
 
 const routerStartupSteps: RouterStartupChecklistStep[] = [
-  { key: 'prepare', label: '\u5199\u5165 Codex \u8def\u7531\u914d\u7f6e', status: 'pending', message: '\u7b49\u5f85\u5199\u5165\u914d\u7f6e...' },
-  { key: 'threads', label: '\u6062\u590d\u4f1a\u8bdd\u5217\u8868', status: 'pending', message: '\u7b49\u5f85\u6062\u590d\u4f1a\u8bdd\u7d22\u5f15\u548c\u4fa7\u8fb9\u680f...' },
-  { key: 'port', label: '\u68c0\u67e5 Router \u7aef\u53e3', status: 'pending', message: '\u7b49\u5f85\u68c0\u67e5\u7aef\u53e3...' },
-  { key: 'start', label: '\u542f\u52a8\u672c\u5730 Router', status: 'pending', message: '\u7b49\u5f85\u542f\u52a8\u670d\u52a1...' },
-  { key: 'codex', label: '\u5904\u7406 Codex \u91cd\u542f', status: 'pending', message: '\u7b49\u5f85\u5904\u7406 Codex \u91cd\u542f...' },
+  { key: 'files', label: '\u68c0\u6d4b\u6570\u636e\u6587\u4ef6', status: 'pending', message: '\u7b49\u5f85\u68c0\u6d4b config.toml \u548c models_cache.json...' },
+  { key: 'catalog', label: '\u5907\u4efd\u5e76\u5408\u5e76\u6a21\u578b', status: 'pending', message: '\u7b49\u5f85\u5907\u4efd models_cache.json \u5e76\u5408\u5e76\u6fc0\u6d3b\u6a21\u578b...' },
+  { key: 'port', label: '\u68c0\u6d4b Router \u7aef\u53e3', status: 'pending', message: '\u7b49\u5f85\u68c0\u6d4b\u7aef\u53e3...' },
+  { key: 'start', label: '\u542f\u52a8 Router', status: 'pending', message: '\u7b49\u5f85\u542f\u52a8\u8def\u7531...' },
 ];
 
 const routerStopSteps: RouterStartupChecklistStep[] = [
   { key: 'stop', label: '\u505c\u6b62\u672c\u5730 Router', status: 'pending', message: '\u7b49\u5f85\u505c\u6b62\u670d\u52a1...' },
-  { key: 'codex', label: '\u6062\u590d Codex \u914d\u7f6e', status: 'pending', message: '\u7b49\u5f85\u6062\u590d\u914d\u7f6e...' },
 ];
 
 function markStepRunning(steps: RouterStartupChecklistStep[], key: string): RouterStartupChecklistStep[] {
@@ -92,7 +94,7 @@ function markFirstRunningAsError(steps: RouterStartupChecklistStep[], message: s
 }
 
 
-const LOCKED_SCROLL_NAV_ITEMS = new Set<NavItem>(['\u8d26\u53f7\u7ba1\u7406', '\u6a21\u578b\u7ba1\u7406', '\u4f1a\u8bdd\u7ba1\u7406', '\u6280\u80fd\u7ba1\u7406', 'MCP\u7ba1\u7406', '\u7ef4\u62a4\u5de5\u5177', '\u8bbe\u7f6e']);
+const LOCKED_SCROLL_NAV_ITEMS = new Set<NavItem>(['\u8def\u7531\u7ba1\u7406', '\u8d26\u53f7\u7ba1\u7406', '\u6a21\u578b\u7ba1\u7406', '\u4f1a\u8bdd\u7ba1\u7406', '\u670d\u52a1', '\u8bbe\u7f6e', '\u65e5\u5fd7']);
 const DEFAULT_NAV_ITEM = navItems[0];
 const ACTIVE_NAV_STORAGE_KEY = 'codex-proxy.activeNav';
 
@@ -114,6 +116,7 @@ function readSavedNav(): NavItem {
 export function App() {
   const [activeNav, setActiveNav] = useState<NavItem>(() => readSavedNav());
   const [models, setModels] = useState<ModelConfig[]>([]);
+  const [catalogModels, setCatalogModels] = useState<CatalogModelOption[]>([]);
   const [routerStatus, setRouterStatus] = useState<RouterStatus>('stopped');
   const [routerRuntimeInfo, setRouterRuntimeInfo] = useState<RouterRuntimeInfo>(createDefaultRouterRuntimeInfo());
   const [routerLogs, setRouterLogs] = useState<RouterLogEntry[]>([]);
@@ -122,6 +125,7 @@ export function App() {
   const [routerActionRunning, setRouterActionRunning] = useState(false);
   const [appOperationLogs, setAppOperationLogs] = useState<AppOperationLogEntry[]>([]);
   const [appSettings, setAppSettings] = useState<AppSettings>(createDefaultAppSettings());
+  const [routerConfig, setRouterConfig] = useState<RouterConfig>(createDefaultRouterConfig());
   const [localConfigPaths, setLocalConfigPaths] = useState<LocalConfigPaths>(createDefaultLocalConfigPaths());
   const [filePreview, setFilePreview] = useState<FilePreviewResult | null>(null);
   const [syncCatalogPreview, setSyncCatalogPreview] = useState<SyncCatalogResult | null>(null);
@@ -199,16 +203,32 @@ export function App() {
   }, [activeNav]);
 
   useEffect(() => {
+    if (activeNav !== '\u65e5\u5fd7') return;
+    void handleRouterLogsRefresh();
+    void handleAppLogsSearch('', 'all');
+  }, [activeNav]);
+
+  useEffect(() => {
     if (!toast.title && !toast.description) return;
     const timer = window.setTimeout(() => setToast({ title: '', description: '' }), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const loadCatalogModels = async () => {
+    try {
+      setCatalogModels(await invokeReadCatalogModelOptions());
+    } catch {
+      setCatalogModels([]);
+    }
+  };
+
   const refreshBaseState = async () => {
     await Promise.allSettled([
       invokeReadAppSettings().then(setAppSettings),
+      invokeReadRouterConfig().then(setRouterConfig),
       invokeReadProviderConfig().then((config) => setModels((current) => providerConfigToModels(config, current))),
       invokeRouterCommand(ROUTER_COMMANDS.status).then(applyRouterCommandResult),
+      loadCatalogModels(),
     ]);
   };
 
@@ -277,7 +297,7 @@ export function App() {
     }
   };
 
-  const handleRouterToggle = async (codexRestartMode: CodexRestartMode = DEFAULT_ROUTER_START_CODEX_RESTART_MODE) => {
+  const handleRouterToggle = async () => {
     if (routerActionRunning) return;
 
     if (routerStatus === 'running') {
@@ -285,16 +305,16 @@ export function App() {
       return;
     }
 
-    await runRouterStart(codexRestartMode);
+    await runRouterStart();
   };
 
-  const handleRouterRestart = async (codexRestartMode: CodexRestartMode = DEFAULT_ROUTER_START_CODEX_RESTART_MODE) => {
+  const handleRouterRestart = async () => {
     if (routerActionRunning) return;
     if (routerStatus !== 'running') {
       setToast({ title: '\u0052outer \u672a\u542f\u52a8', description: '\u8bf7\u5148\u542f\u52a8 Router\u3002' });
       return;
     }
-    await runRouterStart(codexRestartMode, 'restart');
+    await runRouterStart('restart');
   };
 
   const handleRouterHealthCheck = async () => {
@@ -323,36 +343,61 @@ export function App() {
     }
   };
 
-  const runRouterStart = async (codexRestartMode: CodexRestartMode, operation: 'start' | 'restart' = 'start') => {
+  const runRouterStart = async (operation: 'start' | 'restart' = 'start') => {
     setRouterActionRunning(true);
-    setRouterStartupChecklist({ open: true, running: true, completed: false, visibleCount: routerStartupSteps.length, steps: markStepRunning(routerStartupSteps, 'prepare') });
+    setRouterStartupChecklist({ open: true, running: true, completed: false, visibleCount: routerStartupSteps.length, steps: markStepRunning(routerStartupSteps, 'files') });
 
     try {
-      const preparation = await invokePrepareRouterStartup(codexRestartMode);
+      const routerMode = routerConfig.runtime.router_mode;
+      const preparation = await invokePrepareRouterStartup(routerMode);
       setRouterStartupChecklist((current) => ({
         ...current,
         steps: current.steps.map((step) => {
-          if (step.key === 'prepare') return { ...step, status: 'success', message: `\u914d\u7f6e\u5df2\u5199\u5165\uff1a${preparation.codex_config_path}` };
-          if (step.key === 'threads') return { ...step, status: preparation.thread_restore_restored_count > 0 ? 'success' : 'warning', message: preparation.thread_restore_message };
-          if (step.key === 'port') return { ...step, status: preparation.killed_port_owner ? 'warning' : 'success', message: preparation.killed_port_owner ? '\u5df2\u6e05\u7406\u7aef\u53e3\u5360\u7528' : '\u7aef\u53e3\u53ef\u7528' };
-          if (step.key === 'start') return { ...step, status: 'running', message: operation === 'restart' ? '\u6b63\u5728\u91cd\u542f\u672c\u5730 Router...' : '\u6b63\u5728\u542f\u52a8\u672c\u5730 Router...' };
+          if (step.key === 'files') return { ...step, status: 'success', message: '\u5df2\u68c0\u6d4b config.toml \u548c models_cache.json' };
+          if (step.key === 'catalog') return { ...step, status: 'success', message: `\u5df2\u5907\u4efd\u5e76\u751f\u6210\u6a21\u578b catalog\uff1a${preparation.catalog_path}` };
           return step;
         }),
       }));
 
+      setRouterStartupChecklist((current) => ({
+        ...current,
+        steps: current.steps.map((step) => (step.key === 'port' ? { ...step, status: 'running', message: '\u6b63\u5728\u68c0\u6d4b\u7aef\u53e3...' } : step)),
+      }));
+      const occupancy = await invokePortOccupancyCheck();
+      if (occupancy.occupied && routerStatus !== 'running') {
+        setRouterStartupChecklist((current) => ({
+          ...current,
+          running: false,
+          steps: current.steps.map((step) =>
+            step.key === 'port'
+              ? {
+                  ...step,
+                  status: 'error',
+                  message: `\u7aef\u53e3\u88ab\u5360\u7528\uff08pid=${occupancy.pid ?? '\u672a\u77e5'}${occupancy.process_name ? '\uff0c\u8fdb\u7a0b=' + occupancy.process_name : ''}\uff09\uff0c\u8bf7\u5148\u91ca\u653e\u7aef\u53e3\u540e\u518d\u542f\u52a8\u3002`,
+                }
+              : step,
+          ),
+        }));
+        setToast({ title: '\u0052outer \u542f\u52a8\u5931\u8d25', description: '\u68c0\u6d4b\u5230\u7aef\u53e3\u88ab\u5360\u7528\uff0c\u5df2\u5728\u300c\u68c0\u6d4b\u7aef\u53e3\u300d\u6b65\u9aa4\u6682\u505c\u3002' });
+        return;
+      }
+      setRouterStartupChecklist((current) => ({
+        ...current,
+        steps: current.steps.map((step) => (step.key === 'port' ? { ...step, status: 'success', message: routerMode === 0 ? '\u7aef\u53e3\u53ef\u7528' : '\u4e09\u65b9\u8def\u7531\u4e0d\u542f\u52a8\u672c\u5730\u7aef\u53e3' } : step)),
+      }));
+
+      setRouterStartupChecklist((current) => ({
+        ...current,
+        steps: current.steps.map((step) => (step.key === 'start' ? { ...step, status: 'running', message: operation === 'restart' ? '\u6b63\u5728\u91cd\u542f Router...' : (routerMode === 0 ? '\u6b63\u5728\u542f\u52a8\u672c\u5730 Router...' : '\u6b63\u5728\u542f\u52a8\u4e09\u65b9\u8def\u7531...') } : step)),
+      }));
       const result = await invokeRouterCommand(ROUTER_COMMANDS.start);
       applyRouterCommandResult(result);
-      const codexRestartResult = preparation.codex_restart_attempted
-        ? await invokeRestartCodexApp().catch((error) => ({ success: false, message: formatUnknownError(error) }))
-        : null;
-      const codexRestartMessage = codexRestartResult?.message || preparation.codex_restart_message;
       setRouterStartupChecklist((current) => ({
         ...current,
         running: false,
         completed: true,
         steps: current.steps.map((step) => {
-          if (step.key === 'start') return { ...step, status: 'success', message: `Router ${operation === 'restart' ? '\u5df2\u91cd\u542f' : '\u5df2\u542f\u52a8'}\uff1a${result.health_url}` };
-          if (step.key === 'codex') return { ...step, status: codexRestartResult?.success ? 'success' : 'warning', message: codexRestartMessage };
+           if (step.key === 'start') return { ...step, status: 'success', message: routerMode === 0 ? `Router ${operation === 'restart' ? '\u5df2\u91cd\u542f' : '\u5df2\u542f\u52a8'}\uff1a${result.health_url}` : '\u4e09\u65b9\u8def\u7531\u5df2\u542f\u52a8' };
           return step;
         }),
       }));
@@ -375,9 +420,9 @@ export function App() {
         ...current,
         running: false,
         completed: true,
-        steps: current.steps.map((step) => ({ ...step, status: 'success', message: step.key === 'codex' ? result.codex_restart_message || 'Codex \u91cd\u542f\u5904\u7406\u5b8c\u6210' : '\u5df2\u5b8c\u6210' })),
+        steps: current.steps.map((step) => ({ ...step, status: 'success', message: '\u5df2\u5b8c\u6210' })),
       }));
-      setToast({ title: '\u0052outer \u5df2\u505c\u6b62', description: result.codex_restart_message || '' });
+      setToast({ title: '\u0052outer \u5df2\u505c\u6b62', description: '' });
     } catch (error) {
       setRouterCommandProgress((current) => ({ ...current, running: false, completed: false, steps: markFirstRunningAsError(current.steps, formatUnknownError(error)) }));
       setToast({ title: '\u0052outer \u505c\u6b62\u5931\u8d25', description: formatUnknownError(error) });
@@ -515,7 +560,9 @@ export function App() {
   };
 
   const handleSyncModelsToCatalog = async () => {
+    await invokeSyncOfficialCatalog();
     setSyncCatalogPreview(await invokeSyncEnabledModelsToCatalog());
+    await loadCatalogModels();
   };
 
   const handleAppLogsSearch = async (keyword: string, level: AppOperationLogEntry['level'] | 'all') => {
@@ -529,6 +576,11 @@ export function App() {
   const handleAppSettingsSave = async (settings: AppSettings) => {
     const saved = await invokeWriteAppSettings(settings);
     setAppSettings(saved);
+  };
+
+  const handleRouterConfigSave = async (config: RouterConfig) => {
+    const saved = await invokeWriteRouterConfig(config);
+    setRouterConfig(saved);
   };
 
   const runVersionCheck = async ({ source }: { source: 'manual' | 'startup' }) => {
@@ -625,13 +677,16 @@ export function App() {
 
   const context: PageContext = {
     models,
+    catalogModels,
     enabledModels,
     dashboardSnapshot,
     routerStatus,
+    routerActionRunning,
     routerRuntimeInfo,
     routerLogs,
     appOperationLogs,
     appSettings,
+    routerConfig,
     localConfigPaths,
     syncCatalogPreview,
     routerUrl,
@@ -664,6 +719,7 @@ export function App() {
     handleAppLogsSearch,
     handleAppLogsClear,
     handleAppSettingsSave,
+    handleRouterConfigSave,
     handleSyncCatalogPreviewClose: () => setSyncCatalogPreview(null),
     filePreview,
     handleLocalFilePreview,
@@ -675,9 +731,8 @@ export function App() {
       <div className="flex h-screen flex-col overflow-hidden">
         <TitleBar checkingVersion={checkingVersion} handleVersionCheck={handleVersionCheck} />
         <div className="flex min-h-0 flex-1 overflow-x-hidden">
-          <Sidebar activeNav={activeNav} navItems={navItems} setActiveNav={handleNavChange} />
+          <Sidebar activeNav={activeNav} navItems={navItems} setActiveNav={handleNavChange} routerStatus={routerStatus} routerConfig={routerConfig} />
           <main className={`flex min-w-0 flex-1 flex-col overflow-x-hidden px-8 py-6 ${LOCKED_SCROLL_NAV_ITEMS.has(activeNav) ? 'overflow-y-hidden' : 'overflow-y-auto'}`}>
-            <Header routerStatus={routerStatus} routerActionRunning={routerActionRunning} handleRouterToggle={handleRouterToggle} />
             <div className={LOCKED_SCROLL_NAV_ITEMS.has(activeNav) ? 'flex flex-col min-h-0 flex-1 overflow-hidden' : ''}>
               {renderActivePage(activeNav, context)}
             </div>
@@ -829,11 +884,10 @@ function renderActivePage(activeNav: NavItem, context: PageContext): ReactElemen
     '\u8d26\u53f7\u7ba1\u7406': <AccountManagementPage appSettings={context.appSettings} />,
     '\u6a21\u578b\u7ba1\u7406': <ModelsPage models={context.models} appSettings={context.appSettings} handlePreviewAction={context.handlePreviewAction} handleModelDialogOpen={context.handleModelDialogOpen} handleModelDelete={context.handleModelDelete} handleModelEnabledToggle={context.handleModelEnabledToggle} handleModelSetActive={context.handleModelSetActive} handleModelProxySave={context.handleModelProxySave} handleModelConnectivityTest={context.handleModelConnectivityTest} handleModelChatTest={context.handleModelChatTest} handleModelConfigExport={context.handleModelConfigExport} handleModelConfigImport={context.handleModelConfigImport} handleSyncModelsToCatalog={context.handleSyncModelsToCatalog} />,
     '\u4f1a\u8bdd\u7ba1\u7406': <ThreadManagerPage />,
-    '\u8def\u7531\u7ba1\u7406': <RouterPage routerStatus={context.routerStatus} routerRuntimeInfo={context.routerRuntimeInfo} appSettings={context.appSettings} routerLogs={context.routerLogs} handleRouterToggle={context.handleRouterToggle} handleRouterRestart={context.handleRouterRestart} handleRouterHealthCheck={context.handleRouterHealthCheck} handleRouterLogsRefresh={context.handleRouterLogsRefresh} handleRouterLogsClear={context.handleRouterLogsClear} handleAppSettingsSave={context.handleAppSettingsSave} />,
-    '\u6280\u80fd\u7ba1\u7406': <SkillsManagementPage />,
-    'MCP\u7ba1\u7406': <McpManagementPage />,
-    '\u7ef4\u62a4\u5de5\u5177': <MaintenanceToolsPage appSettings={context.appSettings} handleAppSettingsSave={context.handleAppSettingsSave} handleCodexRestart={context.handleCodexRestart} />,
-    '\u8bbe\u7f6e': <SettingsPage appOperationLogs={context.appOperationLogs} appSettings={context.appSettings} localConfigPaths={context.localConfigPaths} filePreview={context.filePreview} handleLocalFilePreview={context.handleLocalFilePreview} handleLocalFilePreviewClose={context.handleLocalFilePreviewClose} handleAppLogsSearch={context.handleAppLogsSearch} handleAppLogsClear={context.handleAppLogsClear} handleAppSettingsSave={context.handleAppSettingsSave} />,
+     '\u8def\u7531\u7ba1\u7406': <RouterPage routerStatus={context.routerStatus} routerActionRunning={context.routerActionRunning} appSettings={context.appSettings} routerConfig={context.routerConfig} catalogModels={context.catalogModels} localConfigPaths={context.localConfigPaths} handleRouterToggle={context.handleRouterToggle} handleRouterRestart={context.handleRouterRestart} handleRouterHealthCheck={context.handleRouterHealthCheck} handleAppSettingsSave={context.handleAppSettingsSave} handleRouterConfigSave={context.handleRouterConfigSave} handleSyncModelsToCatalog={context.handleSyncModelsToCatalog} handleCodexRestart={context.handleCodexRestart} />,
+    '\u65e5\u5fd7': <LogsPage routerLogs={context.routerLogs} appOperationLogs={context.appOperationLogs} handleRouterLogsRefresh={context.handleRouterLogsRefresh} handleRouterLogsClear={context.handleRouterLogsClear} handleAppLogsSearch={context.handleAppLogsSearch} handleAppLogsClear={context.handleAppLogsClear} />,
+    '\u670d\u52a1': <ServicesPage />,
+    '\u8bbe\u7f6e': <SettingsPage appSettings={context.appSettings} localConfigPaths={context.localConfigPaths} filePreview={context.filePreview} handleLocalFilePreview={context.handleLocalFilePreview} handleLocalFilePreviewClose={context.handleLocalFilePreviewClose} handleAppSettingsSave={context.handleAppSettingsSave} handleCodexRestart={context.handleCodexRestart} />,
   };
 
   return pageMap[activeNav];
@@ -866,6 +920,32 @@ function createDefaultAppSettings(): AppSettings {
       account_proxy_url: 'http://127.0.0.1:1455/v1',
       api_key: createAccountProxyApiKey(),
     },
+    router_name: 'Codex伴侣',
+    router_base_url: '',
+    router_auth_method: 'native',
+    router_auth_external_token: '',
+    router_auth_env_key: '',
+    router_model_catalog_json: '',
+    router_default_model: '',
+    router_mode: 'system',
+    router_auto_restart: false,
+  };
+}
+
+function createDefaultRouterConfig(): RouterConfig {
+  const common = {
+    router_name: '',
+    base_url: '',
+    auth_method: 'native' as const,
+    auth_external_token: '',
+    auth_env_key: '',
+    model_catalog_json: '',
+    default_model: '',
+  };
+  return {
+    system_config: { ...common, router_name: 'Codex伴侣', router_port: ROUTER_PORT, concurrency_limit: 8 },
+    external_config: { ...common },
+    runtime: { router_mode: 0, restart: 0 },
   };
 }
 
@@ -898,6 +978,7 @@ function createDefaultLocalConfigPaths(): LocalConfigPaths {
     catalog_path: '',
     provider_config_path: '',
     app_settings_path: '',
+    router_config_path: '',
     app_log_path: '',
     router_debug_log_path: '',
   };

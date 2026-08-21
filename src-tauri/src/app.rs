@@ -1,4 +1,5 @@
 ﻿use super::*;
+use crate::utils::sqlite::initialize_sqlite_database;
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示窗口", true, None::<&str>)?;
@@ -66,6 +67,9 @@ pub fn run() {
             if let Err(error) = read_app_settings() {
                 eprintln!("App settings startup validation error: {}", error);
             }
+            if let Err(error) = initialize_sqlite_database() {
+                eprintln!("SQLite audit database startup error: {}", error);
+            }
             if let Err(error) = recover_router_state_on_startup() {
                 eprintln!("Router startup recovery error: {}", error);
             }
@@ -103,6 +107,8 @@ pub fn run() {
             import_migration_backup,
             check_latest_version,
             read_provider_config,
+            read_catalog_model_options,
+            sync_official_catalog,
             write_provider_config,
             export_provider_config,
             import_provider_config,
@@ -112,7 +118,8 @@ pub fn run() {
             test_proxy_connection,
             detect_proxy_connection,
             preview_local_file,
-            read_app_settings,
+    read_app_settings,
+    load_router_config_command,
             detect_codex_exe_path_for_settings,
             scan_codex_accounts,
             switch_codex_account,
@@ -153,10 +160,12 @@ pub fn run() {
             restore_codex_thread_index,
             delete_codex_thread_files,
             toggle_codex_token_auto_renew,
-            write_app_settings,
+    write_app_settings,
+    save_router_config_command,
             sync_enabled_models_to_catalog,
             ensure_required_config_files,
-            prepare_router_startup
+            prepare_router_startup,
+            write_codex_router_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,199 +1,136 @@
-import { StatCard } from '../../components/business/PreviewParts';
+import { Cpu, MessageSquare, Plug, Sparkles, Users } from 'lucide-react';
 import { Card, CardContent } from '../../components/ui/Card';
 import type { PageContext } from '../../lib/appTypes';
-import type { ScanSummary, TokenUsageSummary } from '../../types';
-
-type ListenerStatus = {
-  running: boolean;
-  host: string;
-  port: number;
-  callbackUrl: string;
-  message: string;
-};
+import type { TokenUsageSummary } from '../../types';
 
 const text = {
-  accountCount: '\u8d26\u6237\u6570',
-  accountSnapshot: '\u8d26\u53f7\u7ba1\u7406\u5feb\u7167',
-  configuredModels: '\u5df2\u914d\u7f6e\u6a21\u578b',
-  enabledModels: '\u542f\u7528\u6a21\u578b',
-  codexSelectable: '\u53ef\u88ab Codex \u9009\u62e9',
-  skillCount: '\u6280\u80fd\u6570',
-  installedSkills: '\u5df2\u5b89\u88c5 Skills',
-  mcpCount: 'MCP \u6570',
-  enabledCount: '\u4e2a\u5df2\u542f\u7528',
-  waitingRefresh: '\u7b49\u5f85\u81ea\u52a8\u5237\u65b0',
-  serviceListen: '\u670d\u52a1\u76d1\u542c',
-  serviceDescription: '\u670d\u52a1\u8fd0\u884c\u72b6\u6001\u4e0e Token \u7528\u91cf\u6982\u89c8\u3002',
-  routerAddress: '\u672c\u5730 Router',
-  routerRunning: 'Router \u8fd0\u884c\u4e2d',
-  routerStopped: 'Router \u5df2\u505c\u6b62',
-  listenerAddress: '\u8d26\u53f7\u53cd\u4ee3',
-  accountProxyOn: '\u8d26\u53f7\u53cd\u4ee3\u5df2\u5f00\u542f',
-  accountProxyOff: '\u8d26\u53f7\u53cd\u4ee3\u5df2\u5173\u95ed',
-  input: '\u8f93\u5165',
-  output: '\u8f93\u51fa',
-  threadCount: '\u5df2\u6709\u4f1a\u8bdd',
+  overview: '总览',
+  overviewDescription: '本地 Router 与 Codex 运行状态概览。',
+  accountCount: '账户数',
+  accountSnapshot: '账号管理快照',
+  configuredModels: '已配置模型',
+  enabledModels: '启用模型',
+  codexSelectable: '可被 Codex 选择',
+  threadCount: '已有会话',
+  skillCount: '技能数',
+  installedSkills: '已安装 Skills',
+  mcpCount: 'MCP 数',
+  enabledCount: '个已启用',
+  waitingRefresh: '等待自动刷新',
+  guide: '使用说明',
+  guideNote: '若首次安装 ChatGPT，需启动登录一次。',
+  proxyHint: '若需访问 OpenAI 官方代理或境外服务，请在设置中打开代理。',
+  steps: ['账户管理新增账户', '模型管理配置中转站', '路由管理启动路由'],
+  tokenUsage: 'Token 用量',
+  cumulativeToken: '累计 Token',
+  todayToken: '今日 Token',
+  input: '输入',
+  cached: '缓存输入',
+  output: '输出',
+  noData: '暂无数据',
 };
 
-export function DashboardPage({ models, enabledModels, appSettings, routerStatus, routerRuntimeInfo, routerUrl, dashboardSnapshot }: PageContext) {
-  const { threadSummary, accountCount, skillCount, mcpSummary, oauthListenerStatus, tokenUsageSummary, lastUpdatedAt } = dashboardSnapshot;
+export function DashboardPage({ enabledModels, dashboardSnapshot }: PageContext) {
+  const { threadSummary, accountCount, skillCount, mcpSummary, tokenUsageSummary, lastUpdatedAt } = dashboardSnapshot;
   const hasLoaded = lastUpdatedAt !== null;
+  const routerTokens = tokenUsageSummary.router_input_tokens + tokenUsageSummary.router_cached_input_tokens + tokenUsageSummary.router_output_tokens;
+  const cumulativeTokens = routerTokens;
+  const todayTokens = routerTokens;
 
   return (
     <div className="space-y-6">
-      <div className="grid grid-cols-4 gap-4">
-        <StatCard label={text.accountCount} value={hasLoaded ? String(accountCount) : '-'} helper={text.accountSnapshot} />
-        <StatCard label={text.configuredModels} value={String(models.length)} helper="Catalog models" />
-        <StatCard label={text.enabledModels} value={String(enabledModels)} helper={text.codexSelectable} />
-        <ThreadStatCard summary={threadSummary} hasLoaded={hasLoaded} />
+      <div>
+        <h2 className="text-2xl font-bold leading-tight text-slate-950">{text.overview}</h2>
+        <p className="mt-1.5 text-sm text-slate-500">{text.overviewDescription}</p>
       </div>
-      <div className="grid grid-cols-2 gap-4">
-        <StatCard label={text.skillCount} value={hasLoaded ? String(skillCount) : '-'} helper={text.installedSkills} />
-        <StatCard label={text.mcpCount} value={hasLoaded ? String(mcpSummary.total) : '-'} helper={hasLoaded ? `${mcpSummary.enabled} ${text.enabledCount}` : text.waitingRefresh} />
+
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <DashboardStatCard icon={<Users className="h-5 w-5" />} value={hasLoaded ? String(accountCount) : '-'} label={text.accountCount} helper={text.accountSnapshot} />
+        <DashboardStatCard icon={<Cpu className="h-5 w-5" />} value={String(enabledModels)} label={text.enabledModels} helper={text.codexSelectable} />
+        <DashboardStatCard icon={<MessageSquare className="h-5 w-5" />} value={hasLoaded ? String(threadSummary?.totalThreads ?? 0) : '-'} label={text.threadCount} helper={hasLoaded ? formatBytes(threadSummary?.totalSize ?? 0) : text.waitingRefresh} />
+        <DashboardStatCard icon={<Sparkles className="h-5 w-5" />} value={hasLoaded ? String(skillCount) : '-'} label={text.skillCount} helper={text.installedSkills} />
+        <DashboardStatCard icon={<Plug className="h-5 w-5" />} value={hasLoaded ? String(mcpSummary.total) : '-'} label={text.mcpCount} helper={hasLoaded ? `${mcpSummary.enabled} ${text.enabledCount}` : text.waitingRefresh} />
       </div>
-      <ServiceStatusPanel
-        routerStatus={routerStatus}
-        routerRuntimeInfo={routerRuntimeInfo}
-        routerUrl={routerUrl}
-        routerPort={appSettings.router_port}
-        oauthListenerStatus={oauthListenerStatus}
-        accountProxyEnabled={appSettings.account_proxy?.account_proxy_enabled === true}
-        tokenUsageSummary={tokenUsageSummary}
-        hasLoaded={hasLoaded}
-      />
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <GuideCard />
+        <TokenPanel
+          cumulativeTokens={cumulativeTokens}
+          todayTokens={todayTokens}
+          summary={tokenUsageSummary}
+          hasLoaded={hasLoaded}
+        />
+      </div>
     </div>
   );
 }
 
-function ServiceStatusPanel({
-  routerStatus,
-  routerRuntimeInfo,
-  routerUrl,
-  routerPort,
-  oauthListenerStatus,
-  accountProxyEnabled,
-  tokenUsageSummary,
-  hasLoaded,
-}: {
-  routerStatus: PageContext['routerStatus'];
-  routerRuntimeInfo: PageContext['routerRuntimeInfo'];
-  routerUrl: string;
-  routerPort: number;
-  oauthListenerStatus: ListenerStatus | null;
-  accountProxyEnabled: boolean;
-  tokenUsageSummary: TokenUsageSummary;
-  hasLoaded: boolean;
-}) {
-  const routerRunning = routerStatus === 'running';
-  const listenerHost = oauthListenerStatus?.host || '127.0.0.1';
-  const listenerPort = oauthListenerStatus?.port || 1455;
-  const listenerUrl = `http://${listenerHost}:${listenerPort}/v1`;
-  const displayRouterUrl = routerUrl || `http://${routerRuntimeInfo.host || '127.0.0.1'}:${routerRuntimeInfo.port || routerPort}`;
+function GuideCard() {
   return (
     <Card>
       <CardContent>
-        <div className="mb-4 flex items-center justify-between gap-3">
-          <div>
-            <h3 className="text-base font-bold text-slate-950">{text.serviceListen}</h3>
-            <p className="mt-1 text-sm text-slate-500">{text.serviceDescription}</p>
+        <h3 className="text-base font-bold text-slate-950">{text.guide}</h3>
+        <div className="mt-3 rounded-xl bg-amber-50 px-3 py-2.5 text-sm leading-6 text-amber-700">{text.guideNote}</div>
+        <div className="mt-3 rounded-xl bg-sky-50 px-3 py-2.5 text-sm leading-6 text-sky-700">{text.proxyHint}</div>
+        <ol className="mt-4 space-y-3">
+          {text.steps.map((step, index) => (
+            <li key={step} className="flex items-center gap-3">
+              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-indigo-50 text-sm font-semibold text-indigo-600">{index + 1}</span>
+              <span className="text-sm text-slate-700">{step}</span>
+            </li>
+          ))}
+        </ol>
+      </CardContent>
+    </Card>
+  );
+}
+
+function TokenPanel({ cumulativeTokens, todayTokens, summary, hasLoaded }: { cumulativeTokens: number; todayTokens: number; summary: TokenUsageSummary; hasLoaded: boolean }) {
+  return (
+    <Card>
+      <CardContent>
+        <h3 className="text-base font-bold text-slate-950">{text.tokenUsage}</h3>
+        <div className="mt-4 grid grid-cols-2 gap-4">
+          <div className="rounded-2xl bg-slate-50 px-4 py-4">
+            <div className="text-xs text-slate-500">{text.cumulativeToken}</div>
+            <div className="mt-2 text-2xl font-bold text-slate-950">{hasLoaded ? formatTokenCount(cumulativeTokens) : text.noData}</div>
+          </div>
+          <div className="rounded-2xl bg-slate-50 px-4 py-4">
+            <div className="text-xs text-slate-500">{text.todayToken}</div>
+            <div className="mt-2 text-2xl font-bold text-slate-950">{hasLoaded ? formatTokenCount(todayTokens) : text.noData}</div>
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <ServiceListenItem
-            label={text.routerAddress}
-            value={displayRouterUrl}
-            running={routerRunning}
-            statusText={routerRunning ? text.routerRunning : text.routerStopped}
-            inputTokens={hasLoaded ? tokenUsageSummary.router_input_tokens : null}
-            cachedInputTokens={hasLoaded ? tokenUsageSummary.router_cached_input_tokens : null}
-            outputTokens={hasLoaded ? tokenUsageSummary.router_output_tokens : null}
-          />
-          <ServiceListenItem
-            label={text.listenerAddress}
-            value={listenerUrl}
-            running={oauthListenerStatus?.running === true}
-            statusText={accountProxyEnabled ? text.accountProxyOn : text.accountProxyOff}
-            helper={oauthListenerStatus?.message}
-            inputTokens={hasLoaded ? tokenUsageSummary.account_proxy_input_tokens : null}
-            cachedInputTokens={hasLoaded ? tokenUsageSummary.account_proxy_cached_input_tokens : null}
-            outputTokens={hasLoaded ? tokenUsageSummary.account_proxy_output_tokens : null}
-          />
+        <div className="mt-4 grid grid-cols-3 gap-3">
+          <TokenBreakdownPill label={text.input} value={hasLoaded ? summary.router_input_tokens : null} />
+          <TokenBreakdownPill label={text.cached} value={hasLoaded ? summary.router_cached_input_tokens : null} />
+          <TokenBreakdownPill label={text.output} value={hasLoaded ? summary.router_output_tokens : null} />
         </div>
       </CardContent>
     </Card>
   );
 }
 
-function ServiceListenItem({
-  label,
-  value,
-  running,
-  statusText,
-  helper,
-  inputTokens,
-  cachedInputTokens,
-  outputTokens,
-}: {
-  label: string;
-  value: string;
-  running: boolean;
-  statusText: string;
-  helper?: string;
-  inputTokens: number | null;
-  cachedInputTokens: number | null;
-  outputTokens: number | null;
-}) {
+function TokenBreakdownPill({ label, value }: { label: string; value: number | null }) {
   return (
-    <div className={`rounded-lg border px-4 py-3 ${running ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}>
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${running ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-            <span className="font-semibold text-slate-900">{label}</span>
-          </div>
-          <div className="mt-2 truncate font-mono text-xs text-slate-600">{value}</div>
-          <div className={`mt-1 text-xs ${running ? 'text-emerald-700' : 'text-amber-700'}`}>{statusText}</div>
-          <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
-            <TokenUsagePill label={text.input} value={inputTokens} tone={running ? 'emerald' : 'amber'} />
-            <TokenUsagePill label="Cache" value={cachedInputTokens} tone={running ? 'emerald' : 'amber'} />
-            <TokenUsagePill label={text.output} value={outputTokens} tone={running ? 'emerald' : 'amber'} />
-          </div>
-          {helper && <div className="mt-1 truncate text-xs text-slate-500">{helper}</div>}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function TokenUsagePill({ label, value, tone }: { label: string; value: number | null; tone: 'emerald' | 'amber' }) {
-  const toneClassName = tone === 'emerald' ? 'border-emerald-100 bg-white/80 text-emerald-700' : 'border-amber-100 bg-white/80 text-amber-700';
-
-  return (
-    <div className={`min-w-0 rounded-lg border px-2.5 py-2 ${toneClassName}`}>
+    <div className="min-w-0 rounded-xl border border-slate-100 bg-white px-3 py-2.5">
       <div className="text-[11px] font-medium text-slate-500">{label}</div>
-      <div className="mt-0.5 truncate font-mono text-sm font-semibold text-slate-950">{formatTokenCount(value)}</div>
+      <div className="mt-0.5 truncate font-mono text-sm font-semibold text-slate-950">{value === null ? '-' : formatTokenCount(value)}</div>
     </div>
   );
 }
 
-function ThreadStatCard({ summary, hasLoaded }: { summary: ScanSummary | null; hasLoaded: boolean }) {
+function DashboardStatCard({ icon, value, label, helper }: { icon: React.ReactNode; value: string; label: string; helper: string }) {
   return (
-    <div className="rounded-3xl border border-slate-200 bg-white shadow-sm">
-      <div className="px-6 py-5">
-        <div className="text-sm font-medium text-slate-500">{text.threadCount}</div>
-        <div className="mt-3">
-          <div>
-            <div className="text-xl font-bold text-slate-950">{hasLoaded ? String(summary?.totalThreads ?? 0) : '-'}</div>
-            <div className="mt-1 text-xs text-slate-400">{hasLoaded ? formatBytes(summary?.totalSize ?? 0) : '-'}</div>
-          </div>
-        </div>
-      </div>
+    <div className="flex flex-col items-center rounded-2xl border border-slate-200 bg-white px-3 py-3 text-center shadow-sm">
+      <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">{icon}</div>
+      <div className="mt-2 text-2xl font-bold leading-none text-slate-950">{value}</div>
+      <div className="mt-1.5 text-xs font-semibold text-slate-800">{label}</div>
+      <div className="mt-1 truncate text-[11px] text-slate-400">{helper}</div>
     </div>
   );
 }
 
-function formatTokenCount(value: number | null) {
-  if (value === null) return '-';
+function formatTokenCount(value: number) {
   return new Intl.NumberFormat('zh-CN').format(value || 0);
 }
 

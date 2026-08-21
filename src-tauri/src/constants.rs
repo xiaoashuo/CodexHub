@@ -3,8 +3,8 @@ use super::*;
 pub(crate) const ROUTER_HOST: &str = "127.0.0.1";
 pub(crate) const ROUTER_PORT: u16 = 25817;
 pub(crate) const HEALTH_PATH: &str = "/health";
-pub(crate) const RESPONSES_PATH: &str = "/codex/router/v1/responses";
-pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/codex/router/v1/chat/completions";
+pub(crate) const RESPONSES_PATH: &str = "/v1/responses";
+pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 pub(crate) const ACCOUNT_PROXY_MODELS_PATH: &str = "/v1/models";
 pub(crate) const ACCOUNT_PROXY_RESPONSES_PATH: &str = "/v1/responses";
 pub(crate) const ACCOUNT_PROXY_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
@@ -19,6 +19,8 @@ pub(crate) const CHATGPT_SESSION_API_URL: &str = "https://chatgpt.com/api/auth/s
 pub(crate) const OFFICIAL_CODEX_RESPONSES_URL: &str =
     "https://chatgpt.com/backend-api/codex/responses";
 pub(crate) const OFFICIAL_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
+pub(crate) const OFFICIAL_CODEX_MODELS_URL: &str =
+    "https://chatgpt.com/backend-api/codex/models?client_version=99.99.99";
 pub(crate) const OFFICIAL_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub(crate) const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Codex, a coding assistant.";
 pub(crate) const OFFICIAL_CODEX_ORIGINATOR: &str = "codex_cli_rs";
@@ -178,6 +180,17 @@ pub(crate) const APP_SETTINGS_RELATIVE_PATH: &[&str] = &[
     "config",
     "app_settings.json",
 ];
+pub(crate) const ROUTER_CONFIG_RELATIVE_PATH: &[&str] = &[
+    ".codex",
+    "ai-router-workspace",
+    "config",
+    "router_config.json",
+];
+pub(crate) const AUDIT_DATABASE_RELATIVE_PATH: &[&str] = &[
+    ".codex",
+    "ai-router-workspace",
+    "router_space.sqlite",
+];
 pub(crate) const MODELS_CACHE_RELATIVE_PATH: &[&str] = &[".codex", "models_cache.json"];
 pub(crate) const EMPTY_JSON_OBJECT_CONTENT: &str = "{}";
 pub(crate) const APP_LOG_MAX_SIZE_BYTES: u64 = 1024 * 1024;
@@ -285,3 +298,4 @@ pub(crate) static ACCOUNT_USAGE_REFRESH_IN_FLIGHT: OnceLock<Mutex<HashSet<String
     OnceLock::new();
 pub(crate) static ACCOUNT_TOKEN_REFRESH_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> =
     OnceLock::new();
+pub(crate) static ACCOUNT_USAGE_LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AccountProxyLogEntry, AppLogFileInfo, AppLogQuery, AppOperationLogEntry, AppSettings, CodexAccountOperationResult, CodexAccountScanResult, CodexRestartMode, FilePreviewResult, LatestVersionCheckResult, LocalConfigPaths, MaintenanceCleanResult, McpServerListResult, McpServerSummary, MigrationBackupInspectionResult, MigrationBackupResult, MigrationRestoreResult, PluginListResult, PortOccupancyInfo, ProviderConfigExportResult, ProviderConfigFile, ProviderConfigImportResult, ProviderModelChatTestResult, ProviderModelListResult, ProviderModelTestResult, ProxyTestResult, RouterLogEntry, RouterStartupPreparationResult, SkillBackupListResult, SkillImportResult, SkillListResult, SkillRemoveResult, SkillRestoreResult, SyncCatalogResult, ThreadRestoreCheckResult, ThreadRestoreResult, ThreadScanResult, TokenUsageSummary, UpdateInstallResult, UpsertMcpServerRequest } from '../types';
+import type { AccountProxyLogEntry, AppLogFileInfo, AppLogQuery, AppOperationLogEntry, AppSettings, CodexAccountOperationResult, CodexAccountScanResult, FilePreviewResult, LatestVersionCheckResult, LocalConfigPaths, MaintenanceCleanResult, McpServerListResult, McpServerSummary, MigrationBackupInspectionResult, MigrationBackupResult, MigrationRestoreResult, PluginListResult, PortOccupancyInfo, ProviderConfigExportResult, ProviderConfigFile, ProviderConfigImportResult, ProviderModelChatTestResult, ProviderModelListResult, ProviderModelTestResult, ProxyTestResult, RouterConfig, RouterLogEntry, RouterStartupPreparationResult, SkillBackupListResult, SkillImportResult, SkillListResult, SkillRemoveResult, SkillRestoreResult, SyncCatalogResult, ThreadRestoreCheckResult, ThreadRestoreResult, ThreadScanResult, TokenUsageSummary, UpdateInstallResult, UpsertMcpServerRequest, CatalogModelOption } from '../types';
 
 export const ROUTER_COMMANDS = {
   start: 'start_router',
@@ -23,7 +23,6 @@ export type TauriRouterCommandResult = {
   started: boolean;
   forwarding_enabled: boolean;
   concurrency_limit: number;
-  codex_restart_message?: string | null;
 };
 
 export async function invokeRouterCommand(command: RouterCommand) {
@@ -40,6 +39,10 @@ export async function invokeRouterRequestLogs() {
 
 export async function invokeClearRouterRequestLogs() {
   return invoke<RouterLogEntry[]>('clear_router_request_logs');
+}
+
+export async function invokeWriteCodexRouterConfig() {
+  return invoke<void>('write_codex_router_config');
 }
 
 export async function invokeAccountProxyRequestLogs() {
@@ -152,6 +155,10 @@ export async function invokeReadAppSettings() {
   return invoke<AppSettings>('read_app_settings');
 }
 
+export async function invokeReadRouterConfig() {
+  return invoke<RouterConfig>('load_router_config_command');
+}
+
 export async function invokeDetectCodexExePath() {
   return invoke<string>('detect_codex_exe_path_for_settings');
 }
@@ -220,12 +227,24 @@ export async function invokeWriteAppSettings(settings: AppSettings) {
   return invoke<AppSettings>('write_app_settings', { settings });
 }
 
+export async function invokeWriteRouterConfig(config: RouterConfig) {
+  return invoke<RouterConfig>('save_router_config_command', { config });
+}
+
 export async function invokeSyncEnabledModelsToCatalog() {
   return invoke<SyncCatalogResult>('sync_enabled_models_to_catalog');
 }
 
-export async function invokePrepareRouterStartup(codexRestartMode: CodexRestartMode = 'restart') {
-  return invoke<RouterStartupPreparationResult>('prepare_router_startup', { request: { codexRestartMode } });
+export async function invokePrepareRouterStartup(routerMode: number) {
+  return invoke<RouterStartupPreparationResult>('prepare_router_startup', { request: { router_mode: routerMode } });
+}
+
+export async function invokeReadCatalogModelOptions() {
+  return invoke<CatalogModelOption[]>('read_catalog_model_options');
+}
+
+export async function invokeSyncOfficialCatalog() {
+  return invoke<CatalogModelOption[]>('sync_official_catalog');
 }
 
 export async function invokeScanCodexThreads() {
@@ -264,8 +283,8 @@ export async function invokeRefreshCodexAccountToken(accountKey: string) {
   return invoke<CodexAccountOperationResult>('refresh_codex_account_token', { request: { accountKey } });
 }
 
-export async function invokeUpdateCodexAccountExpiration(accountKey: string, expiresAt: string | null) {
-  return invoke<CodexAccountOperationResult>('update_codex_account_expiration', { request: { accountKey, expiresAt } });
+export async function invokeUpdateCodexAccountExpiration(accountKey: string, accountEmail: string, expiresAt: string | null) {
+  return invoke<CodexAccountOperationResult>('update_codex_account_expiration', { request: { accountKey, accountEmail, expiresAt } });
 }
 
 export async function invokeStartCodexAccountLogin() {

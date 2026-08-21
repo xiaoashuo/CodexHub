@@ -1,100 +1,48 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Button } from '../../components/ui/Button';
 import { Card, CardContent, CardHeader } from '../../components/ui/Card';
-import type { AppOperationLogEntry, AppSettings, FilePreviewResult, LocalConfigPaths, ProxyTestResult, RestartAppTarget } from '../../types';
+import type { AppSettings, FilePreviewResult, LocalConfigPaths, ProxyTestResult } from '../../types';
 import { APP_VERSION } from '../../lib/constants';
 import { invokeDetectCodexExePath, invokeDetectProxyConnection, invokeTestProxyConnection, invokeToggleCodexTokenAutoRenew } from '../../lib/tauriBridge';
+import { MaintenanceToolsPage } from '../maintenance/MaintenanceToolsPage';
 
-type SettingsTab = 'paths' | 'appLogs';
 type ProxyMode = 'direct' | 'manual';
 
 const DEFAULT_PROXY_URL = 'http://127.0.0.1:4002';
-const DEFAULT_ROUTER_PORT = 25817;
-const DEFAULT_LISTENER_PORT = 1455;
 
-const settingsTabs: { key: SettingsTab; label: string }[] = [
-  { key: 'paths', label: '配置路径' },
-  { key: 'appLogs', label: '应用日志' },
-];
-
-const logLevelOptions: { value: AppOperationLogEntry['level'] | 'all'; label: string }[] = [
-  { value: 'all', label: '全部' },
-  { value: 'info', label: '信息' },
-  { value: 'warn', label: '警告' },
-  { value: 'error', label: '错误' },
-];
-
-export function SettingsPage({
-  appOperationLogs,
+function SystemSettingsPage({
   appSettings,
   localConfigPaths,
   filePreview,
   handleLocalFilePreview,
   handleLocalFilePreviewClose,
-  handleAppLogsSearch,
-  handleAppLogsClear,
   handleAppSettingsSave,
+  handleCodexRestart,
 }: {
-  appOperationLogs: AppOperationLogEntry[];
   appSettings: AppSettings;
   localConfigPaths: LocalConfigPaths;
   filePreview: FilePreviewResult | null;
   handleLocalFilePreview: (path: string) => Promise<void>;
   handleLocalFilePreviewClose: () => void;
-  handleAppLogsSearch: (keyword: string, level: AppOperationLogEntry['level'] | 'all') => Promise<void>;
-  handleAppLogsClear: () => Promise<void>;
   handleAppSettingsSave: (settings: AppSettings) => Promise<void>;
+  handleCodexRestart: () => Promise<{ success: boolean; message: string }>;
 }) {
-  const [activeTab, setActiveTab] = useState<SettingsTab>('paths');
-  const [keyword, setKeyword] = useState('');
-  const [level, setLevel] = useState<AppOperationLogEntry['level'] | 'all'>('all');
-  const filteredLogCount = useMemo(() => appOperationLogs.length, [appOperationLogs]);
-
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
-      <div className="shrink-0">
-        <h2 className="text-2xl font-bold text-slate-950">设置</h2>
-      </div>
-
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <CardHeader className="shrink-0 py-4">
-          <div className="flex flex-wrap gap-4">
-            {settingsTabs.map((tab) => (
-              <button
-                key={tab.key}
-                type="button"
-                className={`border-b-2 px-1 py-1 text-sm font-semibold transition ${
-                  activeTab === tab.key ? 'border-indigo-600 text-indigo-700' : 'border-transparent text-slate-500 hover:text-slate-900'
-                }`}
-                onClick={() => setActiveTab(tab.key)}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
+          <h3 className="text-lg font-bold text-slate-950">配置路径</h3>
         </CardHeader>
         <CardContent className="min-h-0 flex-1 overflow-hidden pt-4">
-          {activeTab === 'paths' ? (
-            <PathSettings
-              appSettings={appSettings}
-              localConfigPaths={localConfigPaths}
-              filePreview={filePreview}
-              handleLocalFilePreview={handleLocalFilePreview}
-              handleLocalFilePreviewClose={handleLocalFilePreviewClose}
-              handleAppSettingsSave={handleAppSettingsSave}
-            />
-          ) : (
-            <ApplicationLogs
-              logs={appOperationLogs}
-              keyword={keyword}
-              level={level}
-              filteredLogCount={filteredLogCount}
-              setKeyword={setKeyword}
-              setLevel={setLevel}
-              handleSearch={() => handleAppLogsSearch(keyword, level)}
-              handleClear={handleAppLogsClear}
-            />
-          )}
+          <PathSettings
+            appSettings={appSettings}
+            localConfigPaths={localConfigPaths}
+            filePreview={filePreview}
+            handleLocalFilePreview={handleLocalFilePreview}
+            handleLocalFilePreviewClose={handleLocalFilePreviewClose}
+            handleAppSettingsSave={handleAppSettingsSave}
+            handleCodexRestart={handleCodexRestart}
+          />
         </CardContent>
       </Card>
     </div>
@@ -108,6 +56,7 @@ function PathSettings({
   handleLocalFilePreview,
   handleLocalFilePreviewClose,
   handleAppSettingsSave,
+  handleCodexRestart,
 }: {
   appSettings: AppSettings;
   localConfigPaths: LocalConfigPaths;
@@ -115,23 +64,20 @@ function PathSettings({
   handleLocalFilePreview: (path: string) => Promise<void>;
   handleLocalFilePreviewClose: () => void;
   handleAppSettingsSave: (settings: AppSettings) => Promise<void>;
+  handleCodexRestart: () => Promise<{ success: boolean; message: string }>;
 }) {
   const [codexDialogOpen, setCodexDialogOpen] = useState(false);
-  const [restartTargetDialogOpen, setRestartTargetDialogOpen] = useState(false);
   const [proxyDialogOpen, setProxyDialogOpen] = useState(false);
-  const [portDialogOpen, setPortDialogOpen] = useState(false);
   const [coreFilesOpen, setCoreFilesOpen] = useState(false);
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden">
       <div className="min-h-0 overflow-y-auto rounded-xl border border-slate-200 bg-white">
-        <SettingsListRow title="Codex 启动命令" description="用于重启 Codex/ChatGPT 客户端的可执行文件路径。" actionLabel="设置" onAction={() => setCodexDialogOpen(true)} />
+        <SettingsListRow title="Codex 启动命令" actionLabel="设置" onAction={() => setCodexDialogOpen(true)} />
         <SettingsListRow
-          title="重新启动应用"
-          description="选择 Router 启停、账号切换等操作后要重启的客户端。"
-          value={getRestartTargetLabel(appSettings.app_restart_target)}
-          actionLabel="设置"
-          onAction={() => setRestartTargetDialogOpen(true)}
+          title="重启ChatGPT"
+          actionLabel="重启"
+          onAction={() => void handleCodexRestart()}
         />
         <SettingsListRow
           title="代理配置"
@@ -140,17 +86,10 @@ function PathSettings({
           actionLabel="设置"
           onAction={() => setProxyDialogOpen(true)}
         />
-        <SettingsListRow
-          title="端口配置"
-          description="Router 服务端口和账号登录回调监听端口。"
-          value={<PortSummaryValue routerPort={appSettings.router_port || DEFAULT_ROUTER_PORT} listenerPort={appSettings.oauth_callback_port || DEFAULT_LISTENER_PORT} />}
-          actionLabel="设置"
-          onAction={() => setPortDialogOpen(true)}
-        />
         <SettingsListRow title="核心文件" description="当前工作目录、配置、Catalog、日志等路径。" actionLabel="查看" onAction={() => setCoreFilesOpen(true)} />
         <SettingsToggleRow
-          title="Router 调试模式"
-          description="记录脱敏后的客户端请求、最终上游请求和上游响应；默认关闭，仅排查问题时开启。"
+          title="调试模式"
+          description=""
           enabled={appSettings.router_debug_mode || false}
           onToggle={async (enabled) => {
             await handleAppSettingsSave({ ...appSettings, router_debug_mode: enabled });
@@ -161,11 +100,39 @@ function PathSettings({
       </div>
 
       {codexDialogOpen && <CodexPathDialog appSettings={appSettings} handleClose={() => setCodexDialogOpen(false)} handleAppSettingsSave={handleAppSettingsSave} />}
-      {restartTargetDialogOpen && <RestartTargetDialog appSettings={appSettings} handleClose={() => setRestartTargetDialogOpen(false)} handleAppSettingsSave={handleAppSettingsSave} />}
       {proxyDialogOpen && <ProxyConfigDialog appSettings={appSettings} handleClose={() => setProxyDialogOpen(false)} handleAppSettingsSave={handleAppSettingsSave} />}
-      {portDialogOpen && <PortConfigDialog appSettings={appSettings} handleClose={() => setPortDialogOpen(false)} handleAppSettingsSave={handleAppSettingsSave} />}
       {coreFilesOpen && <CoreFilesDialog localConfigPaths={localConfigPaths} handleClose={() => setCoreFilesOpen(false)} handleLocalFilePreview={handleLocalFilePreview} />}
       {filePreview && <FilePreviewDialog preview={filePreview} handleLocalFilePreviewClose={handleLocalFilePreviewClose} />}
+    </div>
+  );
+}
+
+export function SettingsPage(props: {
+  appSettings: AppSettings;
+  localConfigPaths: LocalConfigPaths;
+  filePreview: FilePreviewResult | null;
+  handleLocalFilePreview: (path: string) => Promise<void>;
+  handleLocalFilePreviewClose: () => void;
+  handleAppSettingsSave: (settings: AppSettings) => Promise<void>;
+  handleCodexRestart: () => Promise<{ success: boolean; message: string }>;
+}) {
+  const [activeTab, setActiveTab] = useState<'system' | 'maintenance'>('system');
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="mb-5 shrink-0">
+        <div className="flex items-center justify-between gap-4">
+          <h2 className="text-2xl font-bold leading-tight text-slate-950">设置</h2>
+        <div className="flex gap-1 rounded-2xl bg-slate-100 p-1">
+          <button type="button" onClick={() => setActiveTab('system')} className={`rounded-xl px-5 py-2.5 text-sm font-semibold transition ${activeTab === 'system' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>系统设置</button>
+          <button type="button" onClick={() => setActiveTab('maintenance')} className={`rounded-xl px-5 py-2.5 text-sm font-semibold transition ${activeTab === 'maintenance' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>维护工具</button>
+        </div>
+        </div>
+        <p className="mt-1.5 text-sm text-slate-500">管理 Codex 启动、代理、配置路径与应用维护选项。</p>
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {activeTab === 'system' ? <SystemSettingsPage {...props} /> : <MaintenanceToolsPage appSettings={props.appSettings} handleAppSettingsSave={props.handleAppSettingsSave} />}
+      </div>
     </div>
   );
 }
@@ -224,8 +191,7 @@ function TokenAutoRenewRow({ enabled, onToggle }: { enabled: boolean; onToggle: 
   return (
     <div className="grid min-h-[68px] items-center gap-3 border-b border-slate-100 px-4 py-3 last:border-b-0 md:grid-cols-[260px_minmax(0,1fr)_auto]">
       <div className="min-w-0">
-        <div className="text-sm font-semibold text-slate-900">Token 自动续期</div>
-        <div className="mt-1 text-xs leading-5 text-slate-500">定时刷新 access token</div>
+        <div className="text-sm font-semibold text-slate-900">token 自动续期</div>
       </div>
       <div />
       <button
@@ -277,65 +243,6 @@ function SettingsListRow({
   );
 }
 
-function PortSummaryValue({ routerPort, listenerPort }: { routerPort: number; listenerPort: number }) {
-  return (
-    <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-      <span className="inline-flex min-w-0 items-baseline gap-1.5">
-        <span className="font-semibold text-slate-500">Router</span>
-        <span className="font-mono font-semibold text-slate-900">{routerPort}</span>
-      </span>
-      <span className="inline-flex min-w-0 items-baseline gap-1.5">
-        <span className="font-semibold text-slate-500">监听</span>
-        <span className="font-mono font-semibold text-slate-900">{listenerPort}</span>
-      </span>
-    </div>
-  );
-}
-
-function getRestartTargetLabel(target: RestartAppTarget) {
-  return target === 'codex' ? 'Codex' : 'ChatGPT';
-}
-
-function RestartTargetDialog({ appSettings, handleClose, handleAppSettingsSave }: { appSettings: AppSettings; handleClose: () => void; handleAppSettingsSave: (settings: AppSettings) => Promise<void> }) {
-  const [target, setTarget] = useState<RestartAppTarget>(appSettings.app_restart_target || 'chatgpt');
-  const [saving, setSaving] = useState(false);
-
-  const handleSave = async () => {
-    if (saving) return;
-    setSaving(true);
-    try {
-      await handleAppSettingsSave({ ...appSettings, app_restart_target: target });
-      handleClose();
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <DialogFrame title="重新启动应用" description="选择需要自动关闭并重新启动的客户端。" handleClose={handleClose} maxWidth="max-w-xl">
-      <div className="grid gap-3 sm:grid-cols-2">
-        <RestartTargetOption target="chatgpt" currentTarget={target} title="ChatGPT" description="适用于新版客户端。" onSelect={setTarget} />
-        <RestartTargetOption target="codex" currentTarget={target} title="Codex" description="适用于旧版 Codex 客户端。" onSelect={setTarget} />
-      </div>
-      <DialogActions handleClose={handleClose} saving={saving} handleSave={handleSave} />
-    </DialogFrame>
-  );
-}
-
-function RestartTargetOption({ target, currentTarget, title, description, onSelect }: { target: RestartAppTarget; currentTarget: RestartAppTarget; title: string; description: string; onSelect: (target: RestartAppTarget) => void }) {
-  const selected = target === currentTarget;
-  return (
-    <button
-      type="button"
-      className={`rounded-xl border px-4 py-3 text-left transition ${selected ? 'border-indigo-500 bg-indigo-50 text-indigo-900' : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'}`}
-      onClick={() => onSelect(target)}
-    >
-      <div className="text-sm font-semibold">{title}</div>
-      <div className="mt-1 text-xs leading-5 text-slate-500">{description}</div>
-    </button>
-  );
-}
-
 function CodexPathDialog({ appSettings, handleClose, handleAppSettingsSave }: { appSettings: AppSettings; handleClose: () => void; handleAppSettingsSave: (settings: AppSettings) => Promise<void> }) {
   const [codexExePath, setCodexExePath] = useState(appSettings.codex_exe_path);
   const [saving, setSaving] = useState(false);
@@ -375,42 +282,6 @@ function CodexPathDialog({ appSettings, handleClose, handleAppSettingsSave }: { 
         <Button variant="secondary" onClick={handleDetect} disabled={detecting}>{detecting ? '检测中' : '检测'}</Button>
       </div>
       {message && <div className="mt-2 break-all text-xs text-slate-500">{message}</div>}
-      <DialogActions handleClose={handleClose} saving={saving} handleSave={handleSave} />
-    </DialogFrame>
-  );
-}
-
-function PortConfigDialog({ appSettings, handleClose, handleAppSettingsSave }: { appSettings: AppSettings; handleClose: () => void; handleAppSettingsSave: (settings: AppSettings) => Promise<void> }) {
-  const [routerPort, setRouterPort] = useState(String(appSettings.router_port || DEFAULT_ROUTER_PORT));
-  const [oauthCallbackPort, setOauthCallbackPort] = useState(String(appSettings.oauth_callback_port || DEFAULT_LISTENER_PORT));
-  const [saving, setSaving] = useState(false);
-  const [errorMessage, setErrorMessage] = useState('');
-
-  const handleSave = async () => {
-    if (saving) return;
-    const nextRouterPort = normalizePortInput(routerPort, DEFAULT_ROUTER_PORT);
-    const nextOauthCallbackPort = normalizePortInput(oauthCallbackPort, DEFAULT_LISTENER_PORT);
-    if (nextRouterPort === nextOauthCallbackPort) {
-      setErrorMessage('Router 端口和监听端口不能相同。');
-      return;
-    }
-    setSaving(true);
-    setErrorMessage('');
-    try {
-      await handleAppSettingsSave({ ...appSettings, router_port: nextRouterPort, oauth_callback_port: nextOauthCallbackPort });
-      handleClose();
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <DialogFrame title="端口配置" description="Router 端口保存后下次启动 Router 生效；监听端口保存后下次启动应用生效。" handleClose={handleClose} maxWidth="max-w-xl">
-      <div className="grid gap-4 sm:grid-cols-2">
-        <PortInput label="Router 端口" value={routerPort} defaultValue={DEFAULT_ROUTER_PORT} onChange={setRouterPort} />
-        <PortInput label="监听端口" value={oauthCallbackPort} defaultValue={DEFAULT_LISTENER_PORT} onChange={setOauthCallbackPort} />
-      </div>
-      {errorMessage && <div className="mt-4 rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-700">{errorMessage}</div>}
       <DialogActions handleClose={handleClose} saving={saving} handleSave={handleSave} />
     </DialogFrame>
   );
@@ -582,84 +453,6 @@ function DialogActions({ handleClose, saving, handleSave }: { handleClose: () =>
   );
 }
 
-function PortInput({ label, value, defaultValue, onChange }: { label: string; value: string; defaultValue: number; onChange: (value: string) => void }) {
-  return (
-    <label className="block">
-      <span className="text-xs font-semibold text-slate-500">{label}</span>
-      <input className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-indigo-400" type="number" min={1} max={65535} value={value} onChange={(event) => onChange(event.target.value)} placeholder={String(defaultValue)} />
-      <span className="mt-1 block text-xs text-slate-400">默认 {defaultValue}</span>
-    </label>
-  );
-}
-
-function ApplicationLogs({
-  logs,
-  keyword,
-  level,
-  filteredLogCount,
-  setKeyword,
-  setLevel,
-  handleSearch,
-  handleClear,
-}: {
-  logs: AppOperationLogEntry[];
-  keyword: string;
-  level: AppOperationLogEntry['level'] | 'all';
-  filteredLogCount: number;
-  setKeyword: (keyword: string) => void;
-  setLevel: (level: AppOperationLogEntry['level'] | 'all') => void;
-  handleSearch: () => Promise<void>;
-  handleClear: () => Promise<void>;
-}) {
-  const [expandedLogIds, setExpandedLogIds] = useState<Set<string>>(new Set());
-  const toggleLogDetail = (id: string) => {
-    setExpandedLogIds((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
-  return (
-    <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
-      <div className="grid shrink-0 gap-3 lg:grid-cols-[1fr_160px_auto_auto]">
-        <input className="rounded-2xl border border-slate-200 px-4 py-3 text-sm outline-none focus:border-indigo-400" value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="搜索模块、动作、消息、详情" />
-        <select className="rounded-2xl border border-slate-200 px-4 py-3 text-sm outline-none focus:border-indigo-400" value={level} onChange={(event) => setLevel(event.target.value as AppOperationLogEntry['level'] | 'all')}>
-          {logLevelOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </select>
-        <Button onClick={handleSearch}>搜索</Button>
-        <Button variant="ghost" onClick={handleClear}>清空日志</Button>
-      </div>
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 text-sm text-slate-500">
-        <span>当前显示 {filteredLogCount} 条</span>
-        <span>日志以 JSON Lines 写入本地文件。</span>
-      </div>
-      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-2">
-        {logs.map((log) => (
-          <div key={log.id} className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm">
-            <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${getLevelClassName(log.level)}`}>{getLevelText(log.level)}</span>
-                <span className="font-semibold text-slate-800">{log.module}</span>
-                <span className="text-slate-400">/</span>
-                <span className="min-w-0 truncate text-slate-700">{log.action}</span>
-              </div>
-              <div className="flex items-center justify-end gap-2">
-                <span className="font-mono text-xs text-slate-400">{formatLogTime(log.time)}</span>
-                {log.detail && <button className="rounded-md px-2 py-1 text-xs font-semibold text-indigo-600 hover:bg-indigo-50" type="button" onClick={() => toggleLogDetail(log.id)}>{expandedLogIds.has(log.id) ? '收起' : '详情'}</button>}
-              </div>
-            </div>
-            <p className="mt-2 line-clamp-2 leading-6 text-slate-600">{log.message}</p>
-            {log.detail && expandedLogIds.has(log.id) && <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-xs leading-5 text-slate-100">{log.detail}</pre>}
-          </div>
-        ))}
-        {logs.length === 0 && <div className="rounded-2xl bg-slate-50 px-4 py-8 text-center text-sm text-slate-400">暂无应用日志。</div>}
-      </div>
-    </div>
-  );
-}
-
 function buildConfigPathItems(localConfigPaths: LocalConfigPaths) {
   return [
     { label: 'Codex config.toml', value: localConfigPaths.codex_config_path },
@@ -674,38 +467,6 @@ function buildConfigPathItems(localConfigPaths: LocalConfigPaths) {
 function normalizeDisplayVersion(version: string) {
   const normalized = version.trim().replace(/^v/i, '');
   return /^\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.-]+)?$/.test(normalized) ? normalized : APP_VERSION;
-}
-
-function normalizePortInput(value: string, defaultValue: number) {
-  const port = Number.parseInt(value, 10);
-  if (!Number.isFinite(port) || port < 1 || port > 65535) return defaultValue;
-  return port;
-}
-
-function formatLogTime(value: string) {
-  const numericValue = Number(value);
-  const date = Number.isFinite(numericValue) ? new Date(numericValue > 1_000_000_000_000 ? numericValue : numericValue * 1000) : new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  const pad = (number: number) => String(number).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-}
-
-function getLevelText(level: AppOperationLogEntry['level']) {
-  const levelTextMap: Record<AppOperationLogEntry['level'], string> = {
-    info: '信息',
-    warn: '警告',
-    error: '错误',
-  };
-  return levelTextMap[level];
-}
-
-function getLevelClassName(level: AppOperationLogEntry['level']) {
-  const levelClassNameMap: Record<AppOperationLogEntry['level'], string> = {
-    info: 'bg-indigo-50 text-indigo-700',
-    warn: 'bg-amber-50 text-amber-700',
-    error: 'bg-rose-50 text-rose-700',
-  };
-  return levelClassNameMap[level];
 }
 
 function formatUnknownError(error: unknown) {

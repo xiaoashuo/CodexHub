@@ -1,4 +1,4 @@
-import type { AppOperationLogEntry, AppSettings, CodexRestartMode, FilePreviewResult, LocalConfigPaths, ModelConfig, PortOccupancyInfo, RouterCommandProgressState, RouterLogEntry, RouterRuntimeInfo, RouterStartupChecklistState, RouterStatus, ScanSummary, SyncCatalogResult, ToastState, TokenUsageSummary } from '../types';
+import type { AppOperationLogEntry, AppSettings, CatalogModelOption, FilePreviewResult, LocalConfigPaths, ModelConfig, PortOccupancyInfo, RouterCommandProgressState, RouterConfig, RouterLogEntry, RouterRuntimeInfo, RouterStartupChecklistState, RouterStatus, ScanSummary, SyncCatalogResult, ToastState, TokenUsageSummary } from '../types';
 
 export type ModelDialogMode = 'create' | 'edit';
 
@@ -46,13 +46,16 @@ export type DashboardSnapshot = {
 
 export type PageContext = {
   models: ModelConfig[];
+  catalogModels: CatalogModelOption[];
   enabledModels: number;
   dashboardSnapshot: DashboardSnapshot;
   routerStatus: RouterStatus;
+  routerActionRunning: boolean;
   routerRuntimeInfo: RouterRuntimeInfo;
   routerLogs: RouterLogEntry[];
   appOperationLogs: AppOperationLogEntry[];
   appSettings: AppSettings;
+  routerConfig: RouterConfig;
   localConfigPaths: LocalConfigPaths;
   syncCatalogPreview: SyncCatalogResult | null;
   routerUrl: string;
@@ -72,8 +75,8 @@ export type PageContext = {
   handleModelConfigExport: () => Promise<void>;
   handleModelConfigImport: () => Promise<void>;
   handleSyncModelsToCatalog: () => Promise<void>;
-  handleRouterToggle: (codexRestartMode?: CodexRestartMode) => Promise<void>;
-  handleRouterRestart: (codexRestartMode?: CodexRestartMode) => Promise<void>;
+  handleRouterToggle: () => Promise<void>;
+  handleRouterRestart: () => Promise<void>;
   handleCodexRestart: () => Promise<{ success: boolean; message: string }>;
   routerStartupChecklist: RouterStartupChecklistState;
   routerCommandProgress: RouterCommandProgressState;
@@ -85,6 +88,7 @@ export type PageContext = {
   handleAppLogsSearch: (keyword: string, level: AppOperationLogEntry['level'] | 'all') => Promise<void>;
   handleAppLogsClear: () => Promise<void>;
   handleAppSettingsSave: (settings: AppSettings) => Promise<void>;
+  handleRouterConfigSave: (config: RouterConfig) => Promise<void>;
   handleSyncCatalogPreviewClose: () => void;
   filePreview: FilePreviewResult | null;
   handleLocalFilePreview: (path: string) => Promise<void>;

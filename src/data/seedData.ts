@@ -75,6 +75,6 @@ export const initialRouterLogs: RouterLogEntry[] = [
   { time: '14:10:42', source_ip: '127.0.0.1', method: 'GET', path: '/health', status: 'Stopped', target_provider: '-', cost: '-', error_detail: '-' },
 ];
 
-export const navItems = ['总览', '账号管理', '模型管理', '会话管理', '路由管理', '技能管理', 'MCP管理', '维护工具', '设置'] as const;
+export const navItems = ['总览', '账号管理', '模型管理', '会话管理', '路由管理', '日志', '服务', '设置'] as const;
 
 export type NavItem = (typeof navItems)[number];

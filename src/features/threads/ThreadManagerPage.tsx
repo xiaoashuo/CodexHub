@@ -40,6 +40,8 @@ type RestartRestoreDialogState = {
   progress: string;
 };
 
+type SessionFilter = 'all' | 'active' | 'archived' | 'recoverable' | 'abnormal';
+
 export function ThreadManagerPage() {
   const [scanResult, setScanResult] = useState<ThreadScanResult>(cachedThreadScanResult ?? EMPTY_SCAN);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set(cachedExpandedProjectKeys));
@@ -52,6 +54,8 @@ export function ThreadManagerPage() {
   const [deleting, setDeleting] = useState(false);
   const [restartRestoreDialog, setRestartRestoreDialog] = useState<RestartRestoreDialogState | null>(null);
   const [showSubagentSessions, setShowSubagentSessions] = useState(false);
+  const [sessionFilter, setSessionFilter] = useState<SessionFilter>('all');
+  const [sessionKeyword, setSessionKeyword] = useState('');
 
   useEffect(() => {
     if (cachedThreadScanResult) {
@@ -67,8 +71,8 @@ export function ThreadManagerPage() {
   }, [showSubagentSessions]);
 
   const visibleProjects = useMemo(
-    () => filterSubagentSessions(scanResult.projects, showSubagentSessions),
-    [scanResult.projects, showSubagentSessions],
+    () => filterSessionProjects(filterSubagentSessions(scanResult.projects, showSubagentSessions), sessionFilter, sessionKeyword),
+    [scanResult.projects, showSubagentSessions, sessionFilter, sessionKeyword],
   );
   const sortedProjects = useMemo(
     () => [...visibleProjects].sort(compareProjectsByName),
@@ -356,7 +360,33 @@ export function ThreadManagerPage() {
         <div>
           <h2 className="text-2xl font-bold text-slate-950">会话管理</h2>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <div className="relative">
+            <input
+              value={sessionKeyword}
+              onChange={(event) => setSessionKeyword(event.target.value)}
+              placeholder="搜索项目或会话"
+              className="h-10 w-44 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-400"
+            />
+          </div>
+          <div className="flex flex-wrap gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-sm">
+            {([
+              ['all', '全部'],
+              ['active', '活跃'],
+              ['archived', '归档'],
+              ['recoverable', '可恢复'],
+              ['abnormal', '异常'],
+            ] as const).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setSessionFilter(value)}
+                className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition ${sessionFilter === value ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600 shadow-sm">
             <input
               checked={showSubagentSessions}
@@ -418,7 +448,7 @@ export function ThreadManagerPage() {
 
               return (
                 <div key={projectKey} className="min-w-0 overflow-hidden border-b border-slate-100 last:border-b-0">
-                  <div className="flex w-full items-center gap-3 px-1 py-3 transition hover:bg-slate-50">
+                   <div className="flex w-full items-center gap-3 rounded-xl px-2 py-3 transition hover:bg-slate-50">
                     <input
                       aria-label={`选择 ${project.projectName}`}
                       checked={selected}
@@ -437,12 +467,12 @@ export function ThreadManagerPage() {
                       {expanded ? '-' : '+'}
                     </button>
                     <div className="min-w-0 flex-1 text-left">
-                      <div className="truncate font-semibold text-slate-900">{project.projectName}</div>
-                      <div className="mt-0.5 truncate text-xs text-slate-500">{project.cwd || 'Unknown Project'}</div>
+                       <div className="truncate font-semibold text-slate-900">{project.projectName}</div>
+                       <div className="mt-0.5 truncate text-xs text-slate-500" title={project.cwd}>{project.cwd || 'Unknown Project'}</div>
                     </div>
                     <div className="flex shrink-0 flex-wrap justify-end gap-x-3 gap-y-1">
-                      <span className="text-xs font-medium text-slate-500">{project.threadCount} 个线程</span>
-                      <span className="text-xs text-slate-400">{formatBytes(project.totalSize)}</span>
+                       <span className="rounded-full bg-slate-100 px-2 py-1 text-xs font-medium text-slate-600">{project.threadCount} 个会话</span>
+                       <span className="text-xs text-slate-400">{formatBytes(project.totalSize)}</span>
                     </div>
                   </div>
                   {expanded && (
@@ -652,8 +682,8 @@ function ThreadRow({
             {session.parseErrors > 0 && <Badge tone="rose">解析异常</Badge>}
             {session.archived && <Badge tone="amber">归档</Badge>}
             {isSubagentSession(session) && <Badge tone="amber">子代理</Badge>}
-            {!session.archived && (session.missingFromIndex || session.sidebarMissing || session.stateNeedsRepair) && <Badge tone="amber">可恢复</Badge>}
-            {!session.archived && !session.missingFromIndex && !session.sidebarMissing && !session.stateNeedsRepair && session.parseErrors === 0 && <Badge tone="green">正常</Badge>}
+            {!session.archived && isRecoverableSession(session) && <Badge tone="amber">可恢复</Badge>}
+            {!session.archived && !isRecoverableSession(session) && session.parseErrors === 0 && <Badge tone="green">正常</Badge>}
           </div>
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
@@ -666,6 +696,29 @@ function ThreadRow({
       </div>
     </div>
   );
+}
+
+function filterSessionProjects(projects: ProjectGroup[], filter: SessionFilter, keyword: string) {
+  const normalizedKeyword = keyword.trim().toLowerCase();
+  return projects
+    .map((project) => {
+      const sessions = project.sessions.filter((session) => {
+        const matchesFilter = filter === 'all'
+          || (filter === 'archived' && session.archived)
+          || (filter === 'active' && !session.archived)
+          || (filter === 'recoverable' && isRecoverableSession(session))
+          || (filter === 'abnormal' && session.parseErrors > 0);
+        if (!matchesFilter) return false;
+        if (!normalizedKeyword) return true;
+        return `${project.projectName} ${project.cwd ?? ''} ${session.title} ${session.firstUserText ?? ''}`.toLowerCase().includes(normalizedKeyword);
+      });
+      return { ...project, sessions, threadCount: sessions.length, totalSize: sessions.reduce((sum, session) => sum + session.fileSize, 0) };
+    })
+    .filter((project) => project.sessions.length > 0);
+}
+
+function isRecoverableSession(session: ThreadSession) {
+  return session.missingFromIndex || session.sidebarMissing || session.stateNeedsRepair;
 }
 
 function filterSubagentSessions(projects: ProjectGroup[], showSubagentSessions: boolean) {

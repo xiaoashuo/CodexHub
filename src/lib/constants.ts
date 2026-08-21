@@ -1,7 +1,7 @@
-export const APP_VERSION = '0.1.2';
+export const APP_VERSION = '0.1.4';
 export const ROUTER_HOST = '127.0.0.1';
 export const ROUTER_PORT = 25817;
-export const ROUTER_BASE_PATH = '/codex/router/v1';
+export const ROUTER_BASE_PATH = '/v1';
 export const ROUTER_HEALTH_PATH = '/health';
 export const ROUTER_HEALTH_URL = `http://${ROUTER_HOST}:${ROUTER_PORT}${ROUTER_HEALTH_PATH}`;
 export const DEFAULT_PROVIDER_NAME = 'AI智能路由';

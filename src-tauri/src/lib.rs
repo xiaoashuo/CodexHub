@@ -17,18 +17,49 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WindowEvent};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
+use ::time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 mod app;
 mod codex_protocol;
 mod constants;
 mod provider_protocol;
 mod router_dispatcher;
+mod router_config;
 use constants::*;
 use provider_protocol::ProviderProtocol;
 use router_dispatcher::DispatchCandidate;
+use utils::sqlite::insert_audit_log;
+
+mod accounts;
+mod logs;
+mod mcps;
+mod models;
+mod overview;
+mod routes;
+mod sessions;
+mod settings;
+mod skills;
+mod utils;
+
+pub use accounts::*;
+pub use logs::*;
+pub use mcps::*;
+pub use models::*;
+pub use overview::*;
+pub use routes::*;
+pub use sessions::*;
+pub use settings::*;
+pub use skills::*;
+pub use utils::file::*;
+pub use utils::http::*;
+pub use utils::json::*;
+pub use utils::mask::*;
+pub use utils::time::*;
+
+pub use utils::url::*;
 
 struct RouterRuntime {
+    started: bool,
     started_at: Option<Instant>,
     stop_signal: Option<Arc<Mutex<bool>>>,
     handle: Option<JoinHandle<()>>,
@@ -75,7 +106,6 @@ struct RouterCommandResult {
     started: bool,
     forwarding_enabled: bool,
     concurrency_limit: usize,
-    codex_restart_message: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -90,23 +120,18 @@ struct PortOccupancyInfo {
 
 #[derive(serde::Serialize)]
 struct RouterStartupPreparationResult {
+    router_mode: i32,
     codex_config_path: String,
     catalog_path: String,
     provider_config_path: String,
     sync_catalog_result: SyncCatalogResult,
     port_occupancy: PortOccupancyInfo,
     killed_port_owner: bool,
-    thread_restore_restored_count: usize,
-    thread_restore_skipped_count: usize,
-    thread_restore_message: String,
-    codex_restart_attempted: bool,
-    codex_restart_message: String,
 }
 
 #[derive(serde::Deserialize)]
 struct RouterStartupPreparationRequest {
-    #[serde(rename = "codexRestartMode", default = "default_codex_restart_mode")]
-    codex_restart_mode: String,
+    router_mode: i32,
 }
 
 #[derive(serde::Serialize)]
@@ -116,6 +141,7 @@ struct LocalConfigPaths {
     catalog_path: String,
     provider_config_path: String,
     app_settings_path: String,
+    router_config_path: String,
     app_log_path: String,
     router_debug_log_path: String,
 }
@@ -625,6 +651,24 @@ struct AppSettings {
     image_generation_compat_mode: bool,
     #[serde(default)]
     account_proxy: AccountProxySettings,
+    #[serde(default = "default_router_name")]
+    router_name: String,
+    #[serde(default)]
+    router_base_url: String,
+    #[serde(default = "default_router_auth_method")]
+    router_auth_method: String,
+    #[serde(default)]
+    router_auth_external_token: String,
+    #[serde(default)]
+    router_auth_env_key: String,
+    #[serde(default)]
+    router_model_catalog_json: String,
+    #[serde(default)]
+    router_default_model: String,
+    #[serde(default = "default_router_mode")]
+    router_mode: String,
+    #[serde(default)]
+    router_auto_restart: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -652,6 +696,24 @@ struct AppSettingsInput {
     image_generation_compat_mode: bool,
     #[serde(default)]
     account_proxy: AccountProxySettings,
+    #[serde(default = "default_router_name")]
+    router_name: String,
+    #[serde(default)]
+    router_base_url: String,
+    #[serde(default = "default_router_auth_method")]
+    router_auth_method: String,
+    #[serde(default)]
+    router_auth_external_token: String,
+    #[serde(default)]
+    router_auth_env_key: String,
+    #[serde(default)]
+    router_model_catalog_json: String,
+    #[serde(default)]
+    router_default_model: String,
+    #[serde(default = "default_router_mode")]
+    router_mode: String,
+    #[serde(default)]
+    router_auto_restart: bool,
 }
 
 fn default_restart_target() -> String {
@@ -682,7 +744,43 @@ impl Default for AppSettings {
             router_debug_mode: false,
             image_generation_compat_mode: false,
             account_proxy: AccountProxySettings::default(),
+            router_name: default_router_name(),
+            router_base_url: String::new(),
+            router_auth_method: default_router_auth_method(),
+            router_auth_external_token: String::new(),
+            router_auth_env_key: String::new(),
+            router_model_catalog_json: String::new(),
+            router_default_model: String::new(),
+            router_mode: default_router_mode(),
+            router_auto_restart: false,
         }
+    }
+}
+
+fn default_router_name() -> String {
+    CODEX_MODEL_PROVIDER_NAME.to_string()
+}
+
+fn default_router_auth_method() -> String {
+    "native".to_string()
+}
+
+fn default_router_mode() -> String {
+    "system".to_string()
+}
+
+fn normalize_router_mode(value: &str) -> String {
+    if value.trim().eq_ignore_ascii_case("third") {
+        "third".to_string()
+    } else {
+        "system".to_string()
+    }
+}
+
+fn normalize_router_auth_method(value: &str) -> String {
+    match value.trim() {
+        "native" | "external" | "env" => value.trim().to_string(),
+        _ => "native".to_string(),
     }
 }
 
@@ -800,21 +898,21 @@ struct CodexAccountScanResult {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CodexAccountKeyRequest {
+pub struct CodexAccountKeyRequest {
     account_key: String,
     manual: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CodexAccountExpirationRequest {
+pub struct CodexAccountExpirationRequest {
     account_key: String,
     expires_at: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ChatGptSessionImportRequest {
+pub struct ChatGptSessionImportRequest {
     session_json: String,
 }
 
@@ -857,7 +955,7 @@ struct UpdateInstallResult {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CodexAccountOperationResult {
+pub struct CodexAccountOperationResult {
     message: String,
     path: Option<String>,
     scan: CodexAccountScanResult,
@@ -1017,8 +1115,46 @@ struct ProviderModelListResult {
 
 type ProviderConfigInput = std::collections::BTreeMap<String, ProviderConfigItemInput>;
 
-#[derive(serde::Deserialize)]
 struct RouterProviderConfig(serde_json::Map<String, serde_json::Value>);
+
+impl serde::Serialize for RouterProviderConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut items = Vec::new();
+        for (slug, value) in self.0.iter() {
+            let mut object = match value {
+                serde_json::Value::Object(map) => map.clone(),
+                _ => serde_json::Map::new(),
+            };
+            object.insert("slug".to_string(), serde_json::Value::String(slug.clone()));
+            items.push(serde_json::Value::Object(object));
+        }
+        items.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RouterProviderConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut map = serde_json::Map::new();
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let serde_json::Value::Object(mut object) = item {
+                        let slug = match object.get("slug").and_then(|value| value.as_str()) {
+                            Some(slug) if !slug.is_empty() => slug.to_string(),
+                            _ => continue,
+                        };
+                        object.remove("slug");
+                        map.insert(slug, serde_json::Value::Object(object));
+                    }
+                }
+            }
+            serde_json::Value::Object(object) => map = object,
+            _ => {}
+        }
+        Ok(RouterProviderConfig(map))
+    }
+}
 
 #[derive(Clone)]
 struct ProviderRoute {
@@ -1136,10 +1272,6 @@ fn normalize_percent(value: Option<u64>) -> Option<u64> {
     value.filter(|item| *item > 0).map(|item| item.min(100))
 }
 
-fn default_codex_restart_mode() -> String {
-    "skip".to_string()
-}
-
 struct ParsedRequest {
     method: String,
     path: String,
@@ -1183,12 +1315,7 @@ struct OfficialCodexForwardSettings {
     proxy_url: Option<String>,
 }
 
-#[tauri::command]
-async fn start_router() -> Result<RouterCommandResult, String> {
-    tauri::async_runtime::spawn_blocking(start_router_blocking)
-        .await
-        .map_err(|error| format!("启动 Router 任务执行失败：{}", error))?
-}
+
 
 fn start_router_blocking() -> Result<RouterCommandResult, String> {
     let router_port = configured_router_port();
@@ -1196,7 +1323,7 @@ fn start_router_blocking() -> Result<RouterCommandResult, String> {
         let state = router_state();
         let runtime = state.lock().map_err(|error| error.to_string())?;
 
-        if runtime.handle.is_some() {
+        if runtime.started {
             return Ok(build_router_result(&runtime, "running"));
         }
     }
@@ -1204,6 +1331,9 @@ fn start_router_blocking() -> Result<RouterCommandResult, String> {
     ensure_provider_config_file()?;
     let listener = TcpListener::bind((ROUTER_HOST, router_port))
         .map_err(|error| format_listener_bind_error(error, router_port))?;
+
+    ensure_codex_config_backup()?;
+    upsert_codex_router_config()?;
 
     let started_at = Instant::now();
     let stop_signal = Arc::new(Mutex::new(false));
@@ -1241,6 +1371,7 @@ fn start_router_blocking() -> Result<RouterCommandResult, String> {
 
     let state = router_state();
     let mut runtime = state.lock().map_err(|error| error.to_string())?;
+    runtime.started = true;
     runtime.started_at = Some(started_at);
     runtime.stop_signal = Some(stop_signal);
     runtime.handle = Some(handle);
@@ -1250,25 +1381,14 @@ fn start_router_blocking() -> Result<RouterCommandResult, String> {
     Ok(build_router_result(&runtime, "started"))
 }
 
-#[tauri::command]
-async fn stop_router() -> Result<RouterCommandResult, String> {
-    tauri::async_runtime::spawn_blocking(stop_router_blocking)
-        .await
-        .map_err(|error| format!("停止 Router 任务执行失败：{}", error))?
-}
+
 
 fn stop_router_blocking() -> Result<RouterCommandResult, String> {
     let runtime = stop_router_runtime_blocking()?;
-    close_codex_process_for_state_update_if_running()?;
     restore_official_model_catalog()?;
     remove_router_models_from_models_cache()?;
     remove_codex_router_config()?;
-    sync_codex_history_provider("openai", true, false)?;
-    let restart_message = restart_codex_process();
-    let mut result = build_router_result(&runtime, "stopped");
-    result.codex_restart_message = Some(restart_message);
-
-    Ok(result)
+    Ok(build_router_result(&runtime, "stopped"))
 }
 
 fn stop_router_runtime_blocking() -> Result<std::sync::MutexGuard<'static, RouterRuntime>, String> {
@@ -1294,6 +1414,7 @@ fn stop_router_runtime_blocking() -> Result<std::sync::MutexGuard<'static, Route
 
     let state = router_state();
     let mut runtime = state.lock().map_err(|error| error.to_string())?;
+    runtime.started = false;
     runtime.started_at = None;
     runtime.pid = None;
     Ok(runtime)
@@ -1303,105 +1424,23 @@ fn wake_router_listener(router_port: u16) {
     let _ = TcpStream::connect((ROUTER_HOST, router_port));
 }
 
-#[tauri::command]
-fn router_status() -> Result<RouterCommandResult, String> {
-    let state = router_state();
-    let runtime = state.lock().map_err(|error| error.to_string())?;
-    let status = if runtime.handle.is_some() {
-        "running"
-    } else {
-        "stopped"
-    };
 
-    Ok(build_router_result(&runtime, status))
-}
 
-#[tauri::command]
-fn router_request_logs() -> Result<Vec<RouterLogEntry>, String> {
-    read_router_log_entries(REQUEST_LOG_LIMIT)
-}
 
-#[tauri::command]
-fn clear_router_request_logs() -> Result<Vec<RouterLogEntry>, String> {
-    let mut logs = router_logs().lock().map_err(|error| error.to_string())?;
-    logs.clear();
-    let path = router_log_path()?;
-    ensure_parent_dir(&path)?;
-    fs::write(&path, "").map_err(|error| {
-        format!(
-            "clear router log failed: {}, path: {}",
-            error,
-            path.display()
-        )
-    })?;
 
-    Ok(Vec::new())
-}
 
-#[tauri::command]
-fn check_router_port_occupancy() -> PortOccupancyInfo {
-    build_port_occupancy_info()
-}
 
-#[tauri::command]
-fn account_proxy_request_logs() -> Result<Vec<AccountProxyLogEntry>, String> {
-    read_account_proxy_log_entries(REQUEST_LOG_LIMIT)
-}
 
-#[tauri::command]
-fn token_usage_summary() -> Result<TokenUsageSummary, String> {
-    read_request_log_token_usage_summary()
-}
 
-#[tauri::command]
-fn dashboard_quick_counts() -> Result<DashboardQuickCounts, String> {
-    let account_count = quick_account_count()?;
-    let skill_count = quick_skill_count(&codex_skills_path()?)?;
-    let mcp_items = read_mcp_servers_from_config(&codex_config_path()?)?;
-    let mcp_total = mcp_items.len();
-    let mcp_enabled = mcp_items.iter().filter(|item| item.enabled).count();
 
-    Ok(DashboardQuickCounts {
-        account_count,
-        skill_count,
-        mcp_total,
-        mcp_enabled,
-    })
-}
 
-#[tauri::command]
-fn clear_account_proxy_request_logs() -> Result<Vec<AccountProxyLogEntry>, String> {
-    let path = account_proxy_log_path()?;
-    ensure_parent_dir(&path)?;
-    fs::write(&path, "").map_err(|error| {
-        format!(
-            "clear account proxy log failed: {}, path: {}",
-            error,
-            path.display()
-        )
-    })?;
-    Ok(Vec::new())
-}
 
-#[tauri::command]
-fn append_app_log(log: AppOperationLogInput) -> Result<Vec<AppOperationLogEntry>, String> {
-    let log_entry = AppOperationLogEntry {
-        id: current_log_millis().to_string(),
-        time: current_log_time(),
-        level: normalize_log_level(&log.level),
-        module: log.module,
-        action: log.action,
-        message: log.message,
-        detail: log.detail.filter(|detail| !detail.trim().is_empty()),
-    };
 
-    append_app_log_entry(&log_entry)?;
-    search_app_logs(AppLogQuery {
-        keyword: String::new(),
-        level: "all".to_string(),
-        limit: APP_LOG_DEFAULT_LIMIT,
-    })
-}
+
+
+
+
+
 
 fn append_internal_app_log(
     level: &str,
@@ -1423,380 +1462,19 @@ fn append_internal_app_log(
     let _ = append_app_log_entry(&log_entry);
 }
 
-#[tauri::command]
-fn search_app_logs(query: AppLogQuery) -> Result<Vec<AppOperationLogEntry>, String> {
-    rotate_app_log_if_needed()?;
-    let path = app_log_path()?;
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(format!(
-                "璇诲彇搴旂敤鏃ュ織澶辫触：{}锛岃矾寰勶細{}",
-                error,
-                path.display()
-            ))
-        }
-    };
-    let keyword = query.keyword.trim().to_lowercase();
-    let level = query.level.trim().to_lowercase();
-    let limit = query.limit.clamp(1, APP_LOG_MAX_LIMIT);
-    let mut logs = Vec::new();
 
-    for line in text.lines().rev() {
-        if line.trim().is_empty() {
-            continue;
-        }
 
-        let Ok(log) = serde_json::from_str::<AppOperationLogEntry>(line) else {
-            continue;
-        };
 
-        if level != "all" && log.level != level {
-            continue;
-        }
 
-        if !keyword.is_empty() && !app_log_matches_keyword(&log, &keyword) {
-            continue;
-        }
 
-        logs.push(log);
 
-        if logs.len() >= limit {
-            break;
-        }
-    }
 
-    Ok(logs)
-}
 
-#[tauri::command]
-fn clear_app_logs() -> Result<Vec<AppOperationLogEntry>, String> {
-    let path = app_log_path()?;
-    ensure_parent_dir(&path)?;
-    fs::write(&path, "").map_err(|error| {
-        format!(
-            "娓呯┖搴旂敤鏃ュ織澶辫触：{}锛岃矾寰勶細{}",
-            error,
-            path.display()
-        )
-    })?;
 
-    Ok(Vec::new())
-}
 
-#[tauri::command]
-fn app_log_file_info() -> Result<AppLogFileInfo, String> {
-    rotate_app_log_if_needed()?;
-    let path = app_log_path()?;
-    let size = fs::metadata(&path)
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
-    let count = search_app_logs(AppLogQuery {
-        keyword: String::new(),
-        level: "all".to_string(),
-        limit: APP_LOG_MAX_LIMIT,
-    })?
-    .len();
 
-    Ok(AppLogFileInfo {
-        path: path.display().to_string(),
-        size,
-        max_size: APP_LOG_MAX_SIZE_BYTES,
-        count,
-    })
-}
 
-#[tauri::command]
-fn clean_maintenance_data() -> Result<MaintenanceCleanResult, String> {
-    let backup_root = workspace_backup_path()?;
-    let cache_root = build_user_relative_path(WORKSPACE_CACHE_RELATIVE_PATH)?;
-    let mut backup = CleanCount::default();
-    let mut cache = CleanCount::default();
-    let invalid_snapshots = clean_invalid_account_snapshots()?;
 
-    if backup_root.exists() {
-        backup = remove_dir_contents(&backup_root, "备份目录")?;
-    }
-
-    if cache_root.exists() {
-        cache = remove_dir_contents(&cache_root, "缓存目录")?;
-    }
-
-    let models_cache = models_cache_path()?;
-    if models_cache.exists() && models_cache.is_file() {
-        let deleted = remove_file_counted(&models_cache, "模型缓存")?;
-        cache.count += deleted.count;
-        cache.bytes += deleted.bytes;
-    }
-
-    ensure_workspace_layout()?;
-
-    let total_count = backup.count + cache.count + invalid_snapshots.count;
-    let total_bytes = backup.bytes + cache.bytes + invalid_snapshots.bytes;
-
-    Ok(MaintenanceCleanResult {
-        message: format!(
-            "已清理 {} 项，占用 {}。",
-            total_count,
-            format_bytes(total_bytes)
-        ),
-        backup_deleted_count: backup.count,
-        backup_deleted_bytes: backup.bytes,
-        cache_deleted_count: cache.count,
-        cache_deleted_bytes: cache.bytes,
-        invalid_snapshot_deleted_count: invalid_snapshots.count,
-        invalid_snapshot_deleted_bytes: invalid_snapshots.bytes,
-    })
-}
-
-#[tauri::command]
-fn create_migration_backup() -> Result<MigrationBackupResult, String> {
-    ensure_workspace_layout()?;
-
-    let backup_dir = workspace_backup_path()?.join("migration");
-    fs::create_dir_all(&backup_dir).map_err(|error| {
-        format!(
-            "创建迁移备份目录失败：{}，路径：{}",
-            error,
-            backup_dir.display()
-        )
-    })?;
-
-    let backup_path = backup_dir.join(format!("codex-migration-{}.zip", current_log_time()));
-    let backup_tmp_path = backup_path.with_extension("zip.tmp");
-    if backup_tmp_path.exists() {
-        let _ = fs::remove_file(&backup_tmp_path);
-    }
-    let mut backup_tmp_guard = TempPathGuard::new(backup_tmp_path.clone());
-    let mut writer = SimpleZipWriter::create(&backup_tmp_path)?;
-    let mut skipped_items = Vec::new();
-    let mut included_sections = Vec::new();
-    let mut file_times = HashMap::new();
-
-    add_migration_section_file(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "accounts/current-auth.json",
-        codex_auth_path()?,
-    )?;
-    add_migration_section_file(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "accounts/registry.json",
-        codex_accounts_registry_path()?,
-    )?;
-    add_migration_section_dir(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "accounts/snapshots",
-        codex_accounts_snapshots_path()?,
-    )?;
-    included_sections.push("\u{8d26}\u{6237}".to_string());
-
-    add_migration_section_file(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "models/router_provider_config.json",
-        provider_config_path()?,
-    )?;
-    included_sections.push("\u{6a21}\u{578b}".to_string());
-
-    add_migration_section_dir(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "sessions/sessions",
-        codex_sessions_path()?,
-    )?;
-    add_migration_section_dir(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "sessions/archived_sessions",
-        codex_archived_sessions_path()?,
-    )?;
-    add_migration_section_file(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "sessions/session_index.jsonl",
-        codex_session_index_path()?,
-    )?;
-    add_migration_section_file(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "sessions/codex-global-state.json",
-        codex_global_state_path()?,
-    )?;
-    add_migration_section_file(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "sessions/codex-global-state.json.bak",
-        codex_global_state_backup_path()?,
-    )?;
-    included_sections.push("\u{4f1a}\u{8bdd}".to_string());
-
-    add_migration_section_dir(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "skills/installed",
-        codex_skills_path()?,
-    )?;
-    add_migration_section_dir(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "skills/backups",
-        skill_backups_path()?,
-    )?;
-    included_sections.push("\u{6280}\u{80fd}".to_string());
-
-    add_migration_mcp_config(&mut writer, &mut skipped_items)?;
-    included_sections.push("MCP".to_string());
-
-    add_migration_section_file(
-        &mut writer,
-        &mut skipped_items,
-        &mut file_times,
-        "app/app_settings.json",
-        app_settings_path()?,
-    )?;
-
-    let file_times_text = serde_json::to_string_pretty(&file_times)
-        .map_err(|error| format!("生成迁移备份文件时间元数据失败：{}", error))?;
-    writer.add_bytes("metadata/file_times.json", file_times_text.as_bytes())?;
-
-    let manifest = serde_json::json!({
-        "createdAt": current_log_time(),
-        "app": "codex-proxy",
-        "formatVersion": 2,
-        "includedSections": included_sections.clone(),
-        "sensitive": true,
-        "warning": "\u{6b64}\u{8fc1}\u{79fb}\u{5305}\u{53ef}\u{80fd}\u{5305}\u{542b} auth token\u{3001}Provider API Key\u{3001}MCP headers/env \u{4e0e}\u{4f1a}\u{8bdd}\u{5185}\u{5bb9}\u{ff0c}\u{8bf7}\u{53ea}\u{4fdd}\u{5b58}\u{5230}\u{53ef}\u{4fe1}\u{4f4d}\u{7f6e}\u{3002}",
-        "restoreNote": "\u{6062}\u{590d}\u{65f6}\u{4f1a}\u{6309}\u{767d}\u{540d}\u{5355}\u{5bfc}\u{5165}\u{5e76}\u{5408}\u{5e76} MCP\u{ff0c}\u{4e0d}\u{8986}\u{76d6}\u{5b8c}\u{6574} config.toml\u{3002}"
-    });
-    let manifest_text = serde_json::to_string_pretty(&manifest)
-        .map_err(|error| format!("生成迁移备份 manifest 失败：{}", error))?;
-    writer.add_bytes("manifest.json", manifest_text.as_bytes())?;
-
-    let stats = match writer.finish() {
-        Ok(stats) => stats,
-        Err(error) => {
-            let _ = fs::remove_file(&backup_tmp_path);
-            return Err(error);
-        }
-    };
-    fs::rename(&backup_tmp_path, &backup_path).map_err(|error| {
-        let _ = fs::remove_file(&backup_tmp_path);
-        format!(
-            "提交迁移备份 ZIP 失败：{}，路径：{}",
-            error,
-            backup_path.display()
-        )
-    })?;
-    backup_tmp_guard.keep();
-
-    Ok(MigrationBackupResult {
-        backup_path: backup_path.display().to_string(),
-        file_count: stats.file_count,
-        total_bytes: stats.total_bytes,
-        included_sections,
-        skipped_items,
-        message: format!(
-            "\u{8fc1}\u{79fb}\u{5907}\u{4efd}\u{5df2}\u{751f}\u{6210}\u{ff1a}{} \u{4e2a}\u{6587}\u{4ef6}\u{ff0c}{}\u{3002}",
-            stats.file_count,
-            format_bytes(stats.total_bytes)
-        ),
-    })
-}
-
-#[tauri::command]
-fn import_migration_backup(
-    request: ImportMigrationBackupRequest,
-) -> Result<MigrationRestoreResult, String> {
-    let source_path = PathBuf::from(request.source_path.trim());
-    if source_path.as_os_str().is_empty() {
-        return Err("\u{8bf7}\u{9009}\u{62e9}\u{8981}\u{5bfc}\u{5165}\u{7684}\u{8fc1}\u{79fb}\u{5907}\u{4efd} ZIP\u{3002}".to_string());
-    }
-    if !source_path.exists() || !source_path.is_file() {
-        return Err(format!(
-            "\u{8fc1}\u{79fb}\u{5907}\u{4efd}\u{6587}\u{4ef6}\u{4e0d}\u{5b58}\u{5728}\u{ff1a}{}",
-            source_path.display()
-        ));
-    }
-
-    import_migration_backup_transactional(&source_path)
-}
-
-#[tauri::command]
-fn inspect_migration_backup(
-    request: ImportMigrationBackupRequest,
-) -> Result<MigrationBackupInspectionResult, String> {
-    let source_path = PathBuf::from(request.source_path.trim());
-    if source_path.as_os_str().is_empty() {
-        return Err("请选择要检查的迁移备份 ZIP。".to_string());
-    }
-    if !source_path.exists() || !source_path.is_file() {
-        return Err(format!("迁移备份文件不存在：{}", source_path.display()));
-    }
-
-    let mut archive = SimpleZipArchive::open(&source_path)?;
-    let mut session_count = 0usize;
-    let mut project_sessions: HashMap<String, usize> = HashMap::new();
-
-    while let Some(entry) = archive.next_entry()? {
-        if !migration_entry_is_session_file(&entry.name) {
-            continue;
-        }
-        session_count += 1;
-        if let Some(cwd) = extract_session_cwd_from_jsonl_bytes(&entry.bytes) {
-            *project_sessions.entry(cwd).or_insert(0) += 1;
-        }
-    }
-
-    let mut missing_projects = project_sessions
-        .iter()
-        .filter(|(cwd, _)| !Path::new(cwd.as_str()).exists())
-        .map(|(cwd, count)| MigrationMissingProjectSummary {
-            cwd: cwd.clone(),
-            session_count: *count,
-        })
-        .collect::<Vec<_>>();
-    missing_projects.sort_by(|left, right| left.cwd.cmp(&right.cwd));
-    let affected_session_count = missing_projects
-        .iter()
-        .map(|item| item.session_count)
-        .sum::<usize>();
-    let missing_project_count = missing_projects.len();
-    let project_count = project_sessions.len();
-
-    Ok(MigrationBackupInspectionResult {
-        session_count,
-        project_count,
-        missing_project_count,
-        affected_session_count,
-        missing_projects,
-        message: if missing_project_count == 0 {
-            format!(
-                "会话项目目录检查通过：{} 个会话，{} 个项目。",
-                session_count, project_count
-            )
-        } else {
-            format!(
-                "发现 {} 个项目目录不存在，影响 {} 个会话。",
-                missing_project_count, affected_session_count
-            )
-        },
-    })
-}
 
 struct ZipStats {
     file_count: usize,
@@ -2934,233 +2612,19 @@ fn find_snapshot_path_by_account_key(snapshots_dir: &Path, account_key: &str) ->
     None
 }
 
-#[tauri::command]
-fn check_latest_version() -> Result<LatestVersionCheckResult, String> {
-    let mut settings = read_app_settings()?;
-    let current_version = default_system_version();
-    let latest_asset = fetch_latest_codexhub_msi_asset()?;
-    let latest_version = latest_asset.version.clone();
-    let update_available = is_version_newer(&latest_version, &current_version);
-    let message = if update_available {
-        format!(
-            "检测到新版本 {}，当前记录版本 {}。",
-            latest_version, current_version
-        )
-    } else {
-        format!("当前已是最新版本 {}。", current_version)
-    };
 
-    if settings.system_version != current_version {
-        settings.system_version = current_version.clone();
-        save_app_settings(&settings)?;
-    }
 
-    Ok(LatestVersionCheckResult {
-        current_version,
-        latest_version,
-        update_available,
-        asset_name: Some(latest_asset.asset_name),
-        download_url: Some(latest_asset.download_url),
-        release_page_url: Some(latest_asset.release_page_url),
-        message,
-    })
-}
 
-#[tauri::command]
-fn read_provider_config() -> Result<ProviderConfigInput, String> {
-    ensure_provider_config_file()?;
-    let config = load_provider_config()?;
-    let mut result = ProviderConfigInput::new();
 
-    for (slug, value) in config.0 {
-        let route = serde_json::from_value::<ProviderRouteFileItem>(value)
-            .map_err(|error| format!("解析 provider 配置失败：{}，slug：{}", error, slug))?;
-        result.insert(
-            slug.clone(),
-            ProviderConfigItemInput {
-                display_name: if route.display_name.is_empty() {
-                    slug
-                } else {
-                    route.display_name
-                },
-                base_url: route.base_url,
-                api_key: route.api_key,
-                real_model: route.real_model,
-                context_window: normalize_positive_u64(route.context_window),
-                max_context_window: normalize_positive_u64(route.max_context_window),
-                effective_context_window_percent: normalize_percent(
-                    route.effective_context_window_percent,
-                ),
-                proxy_mode: normalize_provider_proxy_mode(&route.proxy_mode),
-                proxy_url: normalize_proxy_url(&route.proxy_url).unwrap_or_default(),
-                protocol_type: normalize_protocol_type(&route.protocol_type),
-                endpoint_path: normalize_endpoint_path(&route.endpoint_path),
-                model_mappings: normalize_model_mappings(&route.model_mappings),
-                priority: route.priority,
-                weight: normalize_provider_weight(route.weight),
-                enabled: route.enabled,
-                active: route.active,
-            },
-        );
-    }
 
-    Ok(result)
-}
 
-#[tauri::command]
-fn write_provider_config(config: ProviderConfigInput) -> Result<ProviderConfigInput, String> {
-    let path = provider_config_path()?;
-    ensure_parent_dir(&path)?;
-    let text = serde_json::to_string_pretty(&config)
-        .map_err(|error| format!("序列化 provider 配置失败：{}", error))?;
-    fs::write(&path, text).map_err(|error| {
-        format!(
-            "写入 provider 配置失败：{}，路径：{}",
-            error,
-            path.display()
-        )
-    })?;
-    read_provider_config()
-}
 
-#[tauri::command]
-fn export_provider_config() -> Result<ProviderConfigExportResult, String> {
-    ensure_provider_config_file()?;
-    let source_path = provider_config_path()?;
-    let backup_dir = model_config_backups_path()?;
-    fs::create_dir_all(&backup_dir).map_err(|error| {
-        format!(
-            "创建模型备份目录失败：{}，路径：{}",
-            error,
-            backup_dir.display()
-        )
-    })?;
 
-    let export_path = backup_dir.join(format!(
-        "router_provider_config-{}.json",
-        current_log_time()
-    ));
-    fs::copy(&source_path, &export_path).map_err(|error| {
-        format!(
-            "导出模型配置失败：{}，源路径：{}，目标路径：{}",
-            error,
-            source_path.display(),
-            export_path.display()
-        )
-    })?;
 
-    Ok(ProviderConfigExportResult {
-        export_path: export_path.display().to_string(),
-    })
-}
 
-#[tauri::command]
-fn import_provider_config(
-    request: ImportProviderConfigRequest,
-) -> Result<ProviderConfigImportResult, String> {
-    let source_path = PathBuf::from(request.source_path.trim());
-    if source_path.as_os_str().is_empty() {
-        return Err("请选择要导入的模型配置文件".to_string());
-    }
 
-    let metadata = fs::metadata(&source_path).map_err(|error| {
-        format!(
-            "读取导入文件失败：{}，路径：{}",
-            error,
-            source_path.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(format!("导入路径不是文件：{}", source_path.display()));
-    }
 
-    let source_text = fs::read_to_string(&source_path).map_err(|error| {
-        format!(
-            "读取导入文件失败：{}，路径：{}",
-            error,
-            source_path.display()
-        )
-    })?;
-    let config: ProviderConfigInput = serde_json::from_str(&source_text).map_err(|error| {
-        format!(
-            "解析模型配置失败：{}，路径：{}",
-            error,
-            source_path.display()
-        )
-    })?;
 
-    let target_path = provider_config_path()?;
-    let backup_path = backup_provider_config_before_import(&target_path)?;
-    let saved = write_provider_config(config)?;
-
-    Ok(ProviderConfigImportResult {
-        config: saved,
-        backup_path: backup_path.map(|path| path.display().to_string()),
-    })
-}
-
-#[tauri::command]
-fn fetch_provider_models(
-    request: FetchProviderModelsRequest,
-) -> Result<ProviderModelListResult, String> {
-    let base_url = request.base_url.trim();
-    let api_key = request.api_key.trim();
-
-    if base_url.is_empty() {
-        return Err("Base URL 不能为空".to_string());
-    }
-
-    if api_key.is_empty() {
-        return Err("API Key 不能为空".to_string());
-    }
-
-    let protocol_type = normalize_protocol_type(&request.protocol_type);
-    let models_url = build_upstream_models_url(base_url);
-    let authorization = format!("Bearer {}", api_key);
-    let effective_proxy_url = normalize_proxy_url(&request.proxy_url);
-    let mut upstream_request = build_upstream_get_request(
-        &models_url,
-        effective_proxy_url.as_deref(),
-        MODEL_LIST_TIMEOUT_SECONDS,
-    );
-    if is_anthropic_protocol(&protocol_type) {
-        upstream_request = upstream_request
-            .set(HEADER_ANTHROPIC_API_KEY, api_key)
-            .set(HEADER_ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE);
-    } else {
-        upstream_request = upstream_request.set(HEADER_AUTHORIZATION, &authorization);
-    }
-    let response = upstream_request.call();
-
-    match response {
-        Ok(response) => {
-            let body = response
-                .into_string()
-                .map_err(|error| format!("读取模型列表响应失败：{}", error))?;
-            Ok(ProviderModelListResult {
-                models: parse_provider_model_ids(&body)?,
-                url: models_url,
-            })
-        }
-        Err(ureq::Error::Status(status_code, response)) => {
-            let body = response.into_string().unwrap_or_default();
-            Err(format!(
-                "获取模型列表失败，上游返回状态码 {}：{}",
-                status_code, body
-            ))
-        }
-        Err(error) => Err(format!("获取模型列表请求失败：{}", error)),
-    }
-}
-
-#[tauri::command]
-async fn test_provider_model(
-    request: TestProviderModelRequest,
-) -> Result<ProviderModelTestResult, String> {
-    tauri::async_runtime::spawn_blocking(move || test_provider_model_blocking(request))
-        .await
-        .map_err(|error| format!("模型测试任务执行失败：{}", error))?
-}
 
 fn test_provider_model_blocking(
     request: TestProviderModelRequest,
@@ -3238,14 +2702,7 @@ fn test_provider_model_blocking(
     }
 }
 
-#[tauri::command]
-async fn test_provider_model_chat(
-    request: TestProviderModelRequest,
-) -> Result<ProviderModelChatTestResult, String> {
-    tauri::async_runtime::spawn_blocking(move || test_provider_model_chat_blocking(request))
-        .await
-        .map_err(|error| format!("模型对话测试任务执行失败：{}", error))?
-}
+
 
 fn test_provider_model_chat_blocking(
     request: TestProviderModelRequest,
@@ -3333,12 +2790,7 @@ fn test_provider_model_chat_blocking(
     }
 }
 
-#[tauri::command]
-async fn test_proxy_connection(request: ProxyTestRequest) -> Result<ProxyTestResult, String> {
-    tauri::async_runtime::spawn_blocking(move || test_proxy_connection_blocking(request))
-        .await
-        .map_err(|error| format!("代理检测任务执行失败：{}", error))?
-}
+
 
 fn test_proxy_connection_blocking(request: ProxyTestRequest) -> Result<ProxyTestResult, String> {
     let proxy_url = request.proxy_url.trim();
@@ -3350,12 +2802,7 @@ fn test_proxy_connection_blocking(request: ProxyTestRequest) -> Result<ProxyTest
     test_proxy_url(proxy_url)
 }
 
-#[tauri::command]
-async fn detect_proxy_connection() -> Result<ProxyTestResult, String> {
-    tauri::async_runtime::spawn_blocking(detect_proxy_connection_blocking)
-        .await
-        .map_err(|error| format!("代理检测任务执行失败：{}", error))?
-}
+
 
 fn detect_proxy_connection_blocking() -> Result<ProxyTestResult, String> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -3423,87 +2870,9 @@ fn test_proxy_url(proxy_url: &str) -> Result<ProxyTestResult, String> {
     }
 }
 
-#[tauri::command]
-fn preview_local_file(request: FilePreviewRequest) -> Result<FilePreviewResult, String> {
-    let path = PathBuf::from(request.path);
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(FilePreviewResult {
-                path: path.display().to_string(),
-                exists: false,
-                content: String::new(),
-                truncated: false,
-            });
-        }
-        Err(error) => {
-            return Err(format!(
-                "璇诲彇鏂囦欢澶辫触：{}锛岃矾寰勶細{}",
-                error,
-                path.display()
-            ))
-        }
-    };
-    let truncated = content.len() > FILE_PREVIEW_MAX_BYTES;
-    let preview_content = if truncated {
-        content.chars().take(FILE_PREVIEW_MAX_BYTES).collect()
-    } else {
-        content
-    };
 
-    Ok(FilePreviewResult {
-        path: path.display().to_string(),
-        exists: true,
-        content: preview_content,
-        truncated,
-    })
-}
 
-#[tauri::command]
-fn read_app_settings() -> Result<AppSettings, String> {
-    ensure_app_settings_file()?;
-    let mut settings = load_app_settings()?;
-    let normalized_activation_time = normalize_app_activation_time(&settings.activation_time)
-        .unwrap_or_else(current_app_activation_time);
-    if settings.activation_time != normalized_activation_time {
-        settings.activation_time = normalized_activation_time;
-        save_app_settings(&settings)?;
-    }
-    if settings.system_version != default_system_version() {
-        settings.system_version = default_system_version();
-        save_app_settings(&settings)?;
-    }
-    let normalized_refresh_seconds =
-        normalize_account_usage_refresh_seconds(settings.account_usage_refresh_seconds);
-    if settings.account_usage_refresh_seconds != normalized_refresh_seconds {
-        settings.account_usage_refresh_seconds = normalized_refresh_seconds;
-        save_app_settings(&settings)?;
-    }
 
-    let normalized_router_port = normalize_port(settings.router_port, default_router_port());
-    let normalized_oauth_callback_port =
-        normalize_port(settings.oauth_callback_port, default_oauth_callback_port());
-    let normalized_account_proxy = normalize_account_proxy_settings(
-        settings.account_proxy.clone(),
-        normalized_oauth_callback_port,
-    );
-    if settings.router_port != normalized_router_port
-        || settings.oauth_callback_port != normalized_oauth_callback_port
-        || settings.account_proxy.account_proxy_url != normalized_account_proxy.account_proxy_url
-        || settings.account_proxy.api_key != normalized_account_proxy.api_key
-    {
-        settings.router_port = normalized_router_port;
-        settings.oauth_callback_port = normalized_oauth_callback_port;
-        settings.account_proxy = normalized_account_proxy;
-        save_app_settings(&settings)?;
-    }
-
-    if refresh_invalid_codex_exe_path(&mut settings)? {
-        save_app_settings(&settings)?;
-    }
-
-    Ok(settings)
-}
 
 fn refresh_invalid_codex_exe_path(settings: &mut AppSettings) -> Result<bool, String> {
     let configured_path = settings.codex_exe_path.trim();
@@ -3548,42 +2917,9 @@ fn is_usable_start_command_for_target(command: &str, target: &str) -> bool {
     true
 }
 
-#[tauri::command]
-fn detect_codex_exe_path_for_settings() -> Result<String, String> {
-    detect_codex_exe_path().ok_or_else(|| {
-        "未检测到 ChatGPT.exe 或 codex.exe，请确认客户端已安装，或手动填写完整路径。".to_string()
-    })
-}
 
-#[tauri::command]
-fn scan_codex_accounts() -> Result<CodexAccountScanResult, String> {
-    ensure_workspace_layout()?;
-    ensure_accounts_registry_file()?;
-    normalize_imported_accounts_registry_paths()?;
-    let mut registry_root = read_accounts_registry()?;
-    let synced_count = sync_accounts_registry_from_snapshot_dir(&mut registry_root)?;
-    let deduplicated = dedupe_registry_accounts_by_email(&mut registry_root)?;
-    complete_missing_account_snapshot_id_tokens(&registry_root)?;
-    if synced_count > 0 || deduplicated {
-        write_accounts_registry(&registry_root)?;
-    }
-    let auth_root = read_json_file_optional(&codex_auth_path()?);
-    let current_account_id = registry_root
-        .get("activeAccountKey")
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
-        .or_else(|| auth_root.as_ref().and_then(find_codex_account_id));
-    let mut accounts = Vec::new();
 
-    collect_accounts_from_registry(&registry_root, &current_account_id, &mut accounts);
 
-    Ok(CodexAccountScanResult {
-        api_healthy: !accounts.is_empty(),
-        accounts,
-        current_account_id,
-        scanned_at: current_log_time(),
-    })
-}
 
 fn quick_account_count() -> Result<usize, String> {
     ensure_accounts_registry_file()?;
@@ -3602,14 +2938,7 @@ fn quick_account_count() -> Result<usize, String> {
     Ok(account_keys.len())
 }
 
-#[tauri::command]
-async fn switch_codex_account(
-    request: CodexAccountKeyRequest,
-) -> Result<CodexAccountOperationResult, String> {
-    tauri::async_runtime::spawn_blocking(move || switch_codex_account_blocking(request))
-        .await
-        .map_err(|error| format!("切换账号任务执行失败：{}", error))?
-}
+
 
 fn switch_codex_account_blocking(
     request: CodexAccountKeyRequest,
@@ -3653,134 +2982,13 @@ fn switch_codex_account_blocking(
     })
 }
 
-#[tauri::command]
-fn remove_codex_account_snapshot(
-    request: CodexAccountKeyRequest,
-) -> Result<CodexAccountOperationResult, String> {
-    let mut registry = read_accounts_registry()?;
-    let removed_snapshot_path = remove_registry_account(&mut registry, &request.account_key)?;
 
-    if let Some(path_text) = removed_snapshot_path.as_ref() {
-        let path = PathBuf::from(path_text);
-        if path.exists() {
-            fs::remove_file(&path).map_err(|error| {
-                format!("删除账号快照失败：{}，路径：{}", error, path.display())
-            })?;
-        }
-    }
 
-    write_accounts_registry(&registry)?;
 
-    Ok(CodexAccountOperationResult {
-        message: "已从账号管理中移除该账号快照。".to_string(),
-        path: removed_snapshot_path,
-        scan: scan_codex_accounts()?,
-    })
-}
 
-#[tauri::command]
-fn update_codex_account_expiration(
-    request: CodexAccountExpirationRequest,
-) -> Result<CodexAccountOperationResult, String> {
-    let expires_at = request
-        .expires_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            let date = OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
-                .map_err(|_| "到期时间格式无效，请重新选择日期。".to_string())?;
-            date.format(&time::format_description::well_known::Rfc3339)
-                .map_err(|_| "到期时间格式无效，请重新选择日期。".to_string())
-        })
-        .transpose()?;
 
-    let mut registry = read_accounts_registry()?;
-    let root = registry
-        .as_object_mut()
-        .ok_or_else(|| "账号注册表格式无效。".to_string())?;
-    let items = root
-        .get_mut("items")
-        .and_then(|value| value.as_array_mut())
-        .ok_or_else(|| "账号注册表缺少 items。".to_string())?;
-    let item = items
-        .iter_mut()
-        .find(|item| json_string_field(item, "accountKey").as_deref() == Some(&request.account_key))
-        .ok_or_else(|| "未找到要设置到期时间的账号。".to_string())?;
-    let account = item
-        .as_object_mut()
-        .ok_or_else(|| "账号注册表条目格式无效。".to_string())?;
 
-    account.insert(
-        "subscriptionExpiresAt".to_string(),
-        expires_at
-            .as_ref()
-            .map(|value| serde_json::Value::String(value.clone()))
-            .unwrap_or(serde_json::Value::Null),
-    );
-    root.insert(
-        "updatedAt".to_string(),
-        serde_json::Value::Number(current_log_time().parse::<i64>().unwrap_or_default().into()),
-    );
-    write_accounts_registry(&registry)?;
 
-    Ok(CodexAccountOperationResult {
-        message: if expires_at.is_some() {
-            "账号到期时间已保存。".to_string()
-        } else {
-            "账号到期时间已清空。".to_string()
-        },
-        path: None,
-        scan: scan_codex_accounts()?,
-    })
-}
-
-#[tauri::command]
-fn export_codex_accounts() -> Result<CodexAccountOperationResult, String> {
-    let registry = read_accounts_registry()?;
-    let export_dir = codex_accounts_backups_path()?.join(format!("export-{}", current_log_time()));
-    let export_snapshots_dir = export_dir.join("snapshots");
-    fs::create_dir_all(&export_snapshots_dir).map_err(|error| {
-        format!(
-            "创建账号导出目录失败：{}，路径：{}",
-            error,
-            export_snapshots_dir.display()
-        )
-    })?;
-
-    let registry_path = codex_accounts_registry_path()?;
-    fs::copy(&registry_path, export_dir.join("registry.json"))
-        .map_err(|error| format!("导出账号 registry 失败：{}", error))?;
-
-    if let Some(items) = registry.get("items").and_then(|value| value.as_array()) {
-        for item in items {
-            let Some(snapshot_path_text) = json_string_field(item, "snapshotPath") else {
-                continue;
-            };
-            let snapshot_path = PathBuf::from(snapshot_path_text);
-            if !snapshot_path.exists() {
-                continue;
-            }
-            let Some(file_name) = snapshot_path.file_name() else {
-                continue;
-            };
-            let _ = fs::copy(&snapshot_path, export_snapshots_dir.join(file_name));
-        }
-    }
-
-    Ok(CodexAccountOperationResult {
-        message: "账号 registry 与快照已导出。".to_string(),
-        path: Some(export_dir.display().to_string()),
-        scan: scan_codex_accounts()?,
-    })
-}
-
-#[tauri::command]
-async fn refresh_codex_accounts_usage() -> Result<CodexAccountOperationResult, String> {
-    tauri::async_runtime::spawn_blocking(refresh_codex_accounts_usage_blocking)
-        .await
-        .map_err(|error| format!("额度刷新任务执行失败：{}", error))?
-}
 
 fn refresh_codex_accounts_usage_blocking() -> Result<CodexAccountOperationResult, String> {
     normalize_imported_accounts_registry_paths()?;
@@ -3811,14 +3019,7 @@ fn refresh_codex_accounts_usage_blocking() -> Result<CodexAccountOperationResult
     Err("通过账号 token 拉取额度失败。".to_string())
 }
 
-#[tauri::command]
-async fn refresh_codex_account_usage(
-    request: CodexAccountKeyRequest,
-) -> Result<CodexAccountOperationResult, String> {
-    tauri::async_runtime::spawn_blocking(move || refresh_codex_account_usage_blocking(request))
-        .await
-        .map_err(|error| format!("额度刷新任务执行失败：{}", error))?
-}
+
 
 fn refresh_codex_account_usage_blocking(
     request: CodexAccountKeyRequest,
@@ -3839,14 +3040,7 @@ fn refresh_codex_account_usage_blocking(
     Err("额度刷新异常，详细信息请查看应用日志".to_string())
 }
 
-#[tauri::command]
-async fn refresh_codex_account_token(
-    request: CodexAccountKeyRequest,
-) -> Result<CodexAccountOperationResult, String> {
-    tauri::async_runtime::spawn_blocking(move || refresh_codex_account_token_blocking(request))
-        .await
-        .map_err(|error| format!("Token 刷新任务执行失败：{}", error))?
-}
+
 
 fn refresh_codex_account_token_blocking(
     request: CodexAccountKeyRequest,
@@ -4066,115 +3260,15 @@ fn start_codex_account_login_legacy() -> Result<CodexAccountOperationResult, Str
     Err("旧版 Codex 登录入口已停用，请使用当前账号登录流程。".to_string())
 }
 
-#[tauri::command]
-fn start_codex_account_login() -> Result<CodexAccountOperationResult, String> {
-    let code_verifier = random_base64_url(96)?;
-    let state = random_base64_url(24)?;
-    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
-    let redirect_uri = oauth_redirect_uri();
-    let login_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&prompt=login&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}",
-        OAUTH_AUTHORIZE_URL,
-        OAUTH_CLIENT_ID,
-        url_encode_component(&redirect_uri),
-        url_encode_component(OAUTH_SCOPE),
-        code_challenge,
-        state,
-    );
 
-    let oauth_state = codex_oauth_state();
-    let mut pending = oauth_state.lock().map_err(|error| error.to_string())?;
-    *pending = Some(CodexOAuthLoginState {
-        state,
-        code_verifier,
-        created_at: Instant::now(),
-    });
-    drop(pending);
-    set_codex_oauth_last_result(CodexOAuthLoginStatus {
-        status: "waiting".to_string(),
-        message: "等待浏览器授权回调。".to_string(),
-        account_key: None,
-        account_email: None,
-    });
 
-    ensure_codex_oauth_callback_listener()?;
 
-    Ok(CodexAccountOperationResult {
-        message: "已生成 OAuth 登录链接。浏览器登录完成后会回调到本地并保存账号。".to_string(),
-        path: Some(login_url),
-        scan: scan_codex_accounts()?,
-    })
-}
 
-#[tauri::command]
-fn codex_oauth_login_status() -> CodexOAuthLoginStatus {
-    codex_oauth_last_result()
-        .lock()
-        .ok()
-        .and_then(|status| status.clone())
-        .unwrap_or(CodexOAuthLoginStatus {
-            status: "idle".to_string(),
-            message: "尚未开始 OAuth 登录。".to_string(),
-            account_key: None,
-            account_email: None,
-        })
-}
 
-#[tauri::command]
-fn codex_oauth_callback_listener_status() -> CodexOAuthCallbackListenerStatus {
-    let result = CODEX_OAUTH_CALLBACK_LISTENER.get();
-    let running = matches!(result, Some(Ok(())));
-    let port = CODEX_OAUTH_CALLBACK_LISTENER_PORT
-        .get()
-        .copied()
-        .unwrap_or_else(configured_oauth_callback_port);
-    let message = match result {
-        Some(Ok(())) => "OAuth 回调监听正常。".to_string(),
-        Some(Err(error)) => error.clone(),
-        None => "OAuth 回调监听尚未启动。".to_string(),
-    };
 
-    CodexOAuthCallbackListenerStatus {
-        running,
-        host: ROUTER_HOST.to_string(),
-        port,
-        callback_url: oauth_redirect_uri(),
-        message,
-    }
-}
 
-#[tauri::command]
-fn import_current_codex_account() -> Result<CodexAccountOperationResult, String> {
-    let mut registry = read_accounts_registry()?;
-    let account_key = upsert_current_codex_auth_account(&mut registry)?;
-    write_accounts_registry(&registry)?;
 
-    let refreshed_usage =
-        refresh_account_usage_from_backend_api(&mut registry, &account_key, false);
-    if refreshed_usage {
-        write_accounts_registry(&registry)?;
-    }
 
-    Ok(CodexAccountOperationResult {
-        message: if refreshed_usage {
-            "已保存当前 Codex 登录，并拉取该账号的最新额度。".to_string()
-        } else {
-            "已保存当前 Codex 登录。额度可稍后点击刷新额度更新。".to_string()
-        },
-        path: find_registry_account(&registry, &account_key)
-            .and_then(|account| json_string_field(&account, "snapshotPath")),
-        scan: scan_codex_accounts()?,
-    })
-}
-
-#[tauri::command]
-async fn import_chatgpt_session_account(
-    request: ChatGptSessionImportRequest,
-) -> Result<CodexAccountOperationResult, String> {
-    tauri::async_runtime::spawn_blocking(move || import_chatgpt_session_account_blocking(request))
-        .await
-        .map_err(|error| format!("web_session 登录任务执行失败：{}", error))?
-}
 
 fn import_chatgpt_session_account_blocking(
     request: ChatGptSessionImportRequest,
@@ -4199,30 +3293,7 @@ fn import_chatgpt_session_account_blocking(
     })
 }
 
-#[tauri::command]
-fn import_cpa_account(request: CpaImportRequest) -> Result<CodexAccountOperationResult, String> {
-    let raw_root = serde_json::from_str::<serde_json::Value>(request.cpa_json.trim())
-        .map_err(|error| format!("解析 CPA JSON 失败：{}", error))?;
-    // Try to unwrap from common outer wrapper fields
-    let auth_root = unwrap_cpa_auth_value(&raw_root);
-    // Normalize identity fields: email, name, account_id, plan from JWT claims
-    let enriched = enrich_codex_auth_identity(auth_root.clone());
-    let mut registry = read_accounts_registry()?;
-    let account_key = upsert_codex_auth_value_account(&mut registry, &enriched, false)?;
-    write_accounts_registry(&registry)?;
 
-    let mut refreshed_registry = read_accounts_registry()?;
-    if refresh_account_usage_from_backend_api(&mut refreshed_registry, &account_key, false) {
-        write_accounts_registry(&refreshed_registry)?;
-    }
-
-    Ok(CodexAccountOperationResult {
-        message: "已通过 CPA JSON 保存账号。".to_string(),
-        path: find_registry_account(&refreshed_registry, &account_key)
-            .and_then(|account| json_string_field(&account, "snapshotPath")),
-        scan: scan_codex_accounts()?,
-    })
-}
 
 /// Try to extract the auth object from common CPA wrapper fields.
 /// If the root already looks like an auth value (has tokens/access_token),
@@ -4245,85 +3316,15 @@ fn unwrap_cpa_auth_value(raw: &serde_json::Value) -> &serde_json::Value {
     raw
 }
 
-#[tauri::command]
-fn start_codex_client_login() -> Result<CodexAccountOperationResult, String> {
-    backup_current_auth_file()?;
-    let auth_path = codex_auth_path()?;
-    if auth_path.exists() {
-        fs::remove_file(&auth_path).map_err(|error| {
-            format!(
-                "清理当前 Codex 登录状态失败：{}，路径：{}",
-                error,
-                auth_path.display()
-            )
-        })?;
-    }
 
-    let restart_message = restart_codex_process();
 
-    Ok(CodexAccountOperationResult {
-        message: format!(
-            "已退出当前 Codex 客户端登录状态，并尝试打开客户端登录页。{}",
-            restart_message
-        ),
-        path: Some(auth_path.display().to_string()),
-        scan: scan_codex_accounts()?,
-    })
-}
 
-#[tauri::command]
-async fn restart_codex_app() -> Result<CodexRestartResult, String> {
-    tauri::async_runtime::spawn_blocking(restart_codex_process_result)
-        .await
-        .map_err(|error| format!("重启 Codex 后台任务执行失败：{}", error))
-}
 
-#[tauri::command]
-fn open_external_url(request: OpenExternalUrlRequest) -> Result<(), String> {
-    let url = request.url.trim();
-    if !url.starts_with("https://auth.openai.com/oauth/authorize?")
-        && !url.starts_with("https://chatgpt.com/")
-        && url != "https://github.com/xiaoashuo/CodexHub"
-        && !url.starts_with("https://github.com/xiaoashuo/CodexHub/releases")
-    {
-        return Err("拒绝打开未允许的外部链接。".to_string());
-    }
 
-    let escaped_url = url.replace('`', "``").replace('\'', "''");
-    let mut command = hidden_command("powershell");
-    command.args([
-        "-NoProfile",
-        "-WindowStyle",
-        "Hidden",
-        "-Command",
-        &format!("Start-Process -FilePath '{}'", escaped_url),
-    ]);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
-    command
-        .spawn()
-        .map_err(|error| format!("打开系统浏览器失败：{}", error))?;
-    Ok(())
-}
 
-#[tauri::command]
-async fn download_and_install_update(
-    app_handle: tauri::AppHandle,
-    request: UpdateInstallRequest,
-) -> Result<UpdateInstallResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        download_and_install_update_blocking(app_handle, request)
-    })
-    .await
-    .map_err(|error| format!("update task failed: {}", error))?
-}
 
-#[tauri::command]
-fn cancel_update_download(app_handle: tauri::AppHandle) -> Result<(), String> {
-    UPDATE_DOWNLOAD_CANCELED.store(true, Ordering::SeqCst);
-    emit_update_progress(&app_handle, "canceled", 0, None, None, "Cancel requested");
-    Ok(())
-}
+
+
 
 fn download_and_install_update_blocking(
     app_handle: tauri::AppHandle,
@@ -4490,305 +3491,37 @@ fn emit_update_progress(
     );
 }
 
-#[tauri::command]
-fn local_config_paths() -> Result<LocalConfigPaths, String> {
-    Ok(LocalConfigPaths {
-        user_home_path: user_home_path()?.display().to_string(),
-        codex_config_path: codex_config_path()?.display().to_string(),
-        catalog_path: catalog_config_path()?.display().to_string(),
-        provider_config_path: provider_config_path()?.display().to_string(),
-        app_settings_path: app_settings_path()?.display().to_string(),
-        app_log_path: app_log_path()?.display().to_string(),
-        router_debug_log_path: router_debug_log_path()?.display().to_string(),
-    })
-}
 
-#[tauri::command]
-fn load_mcp_servers() -> Result<McpServerListResult, String> {
-    let config_path = codex_config_path()?;
-    let items = read_mcp_servers_from_config(&config_path)?;
 
-    Ok(McpServerListResult {
-        total: items.len(),
-        source_path: config_path.display().to_string(),
-        items,
-    })
-}
 
-#[tauri::command]
-fn upsert_mcp_server(request: UpsertMcpServerRequest) -> Result<McpServerSummary, String> {
-    let config_path = codex_config_path()?;
-    let server = McpServerSummary {
-        name: request.name.trim().to_string(),
-        transport: request.transport,
-        enabled: request.enabled,
-        source_path: config_path.display().to_string(),
-        command: request
-            .command
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        args: request
-            .args
-            .into_iter()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .collect(),
-        url: request
-            .url
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        headers: request.headers,
-        environment: request.environment,
-    };
 
-    validate_mcp_server(&server)?;
-    write_mcp_server_to_config(&config_path, &server)?;
-    read_mcp_servers_from_config(&config_path)?
-        .into_iter()
-        .find(|item| item.name == server.name)
-        .ok_or_else(|| "MCP 服务保存后未能重新读取。".to_string())
-}
 
-#[tauri::command]
-fn set_mcp_server_enabled(request: SetMcpServerEnabledRequest) -> Result<McpServerSummary, String> {
-    let config_path = codex_config_path()?;
-    let mut server = read_mcp_servers_from_config(&config_path)?
-        .into_iter()
-        .find(|item| item.name == request.name)
-        .ok_or_else(|| format!("MCP 服务不存在：{}", request.name))?;
-    server.enabled = request.enabled;
-    write_mcp_server_to_config(&config_path, &server)?;
-    Ok(server)
-}
 
-#[tauri::command]
-fn remove_mcp_server(request: RemoveMcpServerRequest) -> Result<McpServerListResult, String> {
-    let config_path = codex_config_path()?;
-    remove_mcp_server_from_config(&config_path, &request.name)?;
-    load_mcp_servers()
-}
 
-#[tauri::command]
-fn load_installed_skills() -> Result<SkillListResult, String> {
-    let skills_dir = codex_skills_path()?;
-    let items = scan_installed_skills(&skills_dir)?;
 
-    Ok(SkillListResult {
-        total: items.len(),
-        root_path: skills_dir.display().to_string(),
-        items,
-    })
-}
 
-#[tauri::command]
-fn load_codex_plugins() -> Result<PluginListResult, String> {
-    load_codex_plugins_result()
-}
 
-#[tauri::command]
-fn set_codex_plugin_enabled(
-    request: SetCodexPluginEnabledRequest,
-) -> Result<PluginListResult, String> {
-    let mut state = read_codex_plugin_state()?;
-    if request.enabled {
-        state.disabled_plugins.remove(&request.id);
-    } else {
-        state.disabled_plugins.insert(request.id);
-    }
-    write_codex_plugin_state(&state)?;
-    load_codex_plugins_result()
-}
 
-#[tauri::command]
-fn set_codex_plugin_skill_enabled(
-    request: SetCodexPluginSkillEnabledRequest,
-) -> Result<PluginListResult, String> {
-    let mut state = read_codex_plugin_state()?;
-    if request.enabled {
-        state.disabled_skills.remove(&request.full_name);
-    } else {
-        state.disabled_skills.insert(request.full_name);
-    }
-    write_codex_plugin_state(&state)?;
-    load_codex_plugins_result()
-}
 
-#[tauri::command]
-fn load_skill_backups() -> Result<SkillBackupListResult, String> {
-    let backup_dir = skill_backups_path()?;
-    let items = scan_skill_backups(&backup_dir)?;
 
-    Ok(SkillBackupListResult {
-        total: items.len(),
-        root_path: backup_dir.display().to_string(),
-        items,
-    })
-}
 
-#[tauri::command]
-fn import_skill(request: ImportSkillRequest) -> Result<SkillImportResult, String> {
-    let skills_dir = codex_skills_path()?;
-    let backup_dir = skill_backups_path()?;
-    fs::create_dir_all(&skills_dir).map_err(|error| {
-        format!(
-            "创建 Skills 目录失败：{}，路径：{}",
-            error,
-            skills_dir.display()
-        )
-    })?;
-    fs::create_dir_all(&backup_dir).map_err(|error| {
-        format!(
-            "创建 Skills 备份目录失败：{}，路径：{}",
-            error,
-            backup_dir.display()
-        )
-    })?;
 
-    let source = resolve_skill_source(Path::new(&request.source_path))?;
-    let target = skills_dir.join(
-        source
-            .file_name()
-            .ok_or_else(|| "无法识别 Skill 目录名。".to_string())?,
-    );
-    let source_canonical = fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
-    let target_canonical = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
 
-    if source_canonical == target_canonical {
-        let skill = load_skill_summary(&target.join("SKILL.md"), &skills_dir)
-            .ok_or_else(|| "Skill 来源无效。".to_string())?;
-        return Ok(SkillImportResult {
-            skill,
-            replaced_existing: false,
-            backup: None,
-        });
-    }
 
-    let replaced_existing = target.exists();
-    let backup = if replaced_existing {
-        let backup = backup_skill_directory(&target, &skills_dir, &backup_dir, "replace")?;
-        fs::remove_dir_all(&target)
-            .map_err(|error| format!("移除旧 Skill 失败：{}，路径：{}", error, target.display()))?;
-        Some(backup)
-    } else {
-        None
-    };
 
-    copy_dir_all(&source, &target)?;
-    let skill = load_skill_summary(&target.join("SKILL.md"), &skills_dir)
-        .ok_or_else(|| "导入后的 Skill 缺少 SKILL.md。".to_string())?;
 
-    Ok(SkillImportResult {
-        skill,
-        replaced_existing,
-        backup,
-    })
-}
 
-#[tauri::command]
-fn remove_skill(request: SkillIdRequest) -> Result<SkillRemoveResult, String> {
-    let skills_dir = codex_skills_path()?;
-    let backup_dir = skill_backups_path()?;
-    let skill = scan_installed_skills(&skills_dir)?
-        .into_iter()
-        .find(|item| item.id == request.id)
-        .ok_or_else(|| format!("Skill 不存在：{}", request.id))?;
-    let dir = PathBuf::from(&skill.directory_path);
-    let backup = backup_skill_directory(&dir, &skills_dir, &backup_dir, "remove")?;
 
-    if dir.exists() {
-        fs::remove_dir_all(&dir)
-            .map_err(|error| format!("移除 Skill 失败：{}，路径：{}", error, dir.display()))?;
-    }
 
-    Ok(SkillRemoveResult {
-        removed_skill_id: request.id,
-        backup,
-        remaining_installed_count: scan_installed_skills(&skills_dir)?.len(),
-    })
-}
 
-#[tauri::command]
-fn restore_skill_backup(request: SkillIdRequest) -> Result<SkillRestoreResult, String> {
-    let skills_dir = codex_skills_path()?;
-    let backup_dir = skill_backups_path()?;
-    let backup_root = backup_dir.join(&request.id);
-    let metadata_path = backup_root.join("metadata.json");
-    let metadata_text = fs::read_to_string(&metadata_path).map_err(|error| {
-        format!(
-            "读取 Skill 备份元数据失败：{}，路径：{}",
-            error,
-            metadata_path.display()
-        )
-    })?;
-    let metadata: SkillBackupMetadata = serde_json::from_str(&metadata_text)
-        .map_err(|error| format!("解析 Skill 备份元数据失败：{}", error))?;
-    let staged = backup_root.join("skill");
-    if !staged.exists() {
-        return Err(format!("Skill 备份已损坏：{}", request.id));
-    }
 
-    let target = skills_dir.join(&metadata.relative_path);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!("创建 Skill 目录失败：{}，路径：{}", error, parent.display())
-        })?;
-    }
 
-    let rollback_backup = if target.exists() {
-        let backup = backup_skill_directory(&target, &skills_dir, &backup_dir, "restore-rollback")?;
-        fs::remove_dir_all(&target).map_err(|error| {
-            format!("移除当前 Skill 失败：{}，路径：{}", error, target.display())
-        })?;
-        Some(backup)
-    } else {
-        None
-    };
 
-    copy_dir_all(&staged, &target)?;
-    let restored_skill = load_skill_summary(&target.join("SKILL.md"), &skills_dir)
-        .ok_or_else(|| "恢复后的 Skill 缺少 SKILL.md。".to_string())?;
-    let backup = SkillBackupSummary {
-        id: metadata.backup_id,
-        skill_id: metadata.skill_id,
-        name: metadata.name,
-        title: metadata.title,
-        relative_path: metadata.relative_path,
-        backup_path: staged.display().to_string(),
-        created_at: metadata.created_at,
-    };
 
-    Ok(SkillRestoreResult {
-        restored_skill,
-        backup,
-        rollback_backup,
-    })
-}
 
-#[tauri::command]
-fn delete_skill_backup(request: SkillIdRequest) -> Result<SkillBackupListResult, String> {
-    let backup_dir = skill_backups_path()?;
-    let target = backup_dir.join(&request.id);
-    if target.exists() {
-        fs::remove_dir_all(&target).map_err(|error| {
-            format!("删除 Skill 备份失败：{}，路径：{}", error, target.display())
-        })?;
-    }
-    load_skill_backups()
-}
 
-#[tauri::command]
-async fn scan_codex_threads() -> Result<ThreadScanResult, String> {
-    tauri::async_runtime::spawn_blocking(scan_codex_threads_blocking)
-        .await
-        .map_err(|error| format!("会话扫描任务执行失败：{}", error))?
-}
 
-#[tauri::command]
-async fn quick_codex_thread_summary() -> Result<ScanSummary, String> {
-    tauri::async_runtime::spawn_blocking(quick_codex_thread_summary_blocking)
-        .await
-        .map_err(|error| format!("quick thread summary task failed: {}", error))?
-}
+
 
 fn quick_codex_thread_summary_blocking() -> Result<ScanSummary, String> {
     let mut total_threads = 0usize;
@@ -5018,14 +3751,7 @@ fn scan_codex_threads_blocking() -> Result<ThreadScanResult, String> {
     })
 }
 
-#[tauri::command]
-async fn delete_codex_thread_files(
-    request: DeleteCodexThreadFilesRequest,
-) -> Result<ThreadScanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || delete_codex_thread_files_blocking(request))
-        .await
-        .map_err(|error| format!("会话删除任务执行失败：{}", error))?
-}
+
 
 fn delete_codex_thread_files_blocking(
     request: DeleteCodexThreadFilesRequest,
@@ -5082,25 +3808,9 @@ fn delete_codex_thread_files_blocking(
     scan_codex_threads_blocking()
 }
 
-#[tauri::command]
-async fn restore_codex_thread_index(
-    request: serde_json::Value,
-) -> Result<RestoreCodexThreadIndexResult, String> {
-    let request = parse_restore_codex_thread_index_request(request)?;
-    tauri::async_runtime::spawn_blocking(move || restore_codex_thread_index_blocking(request))
-        .await
-        .map_err(|error| format!("会话索引恢复任务执行失败：{}", error))?
-}
 
-#[tauri::command]
-async fn check_restore_codex_thread_index(
-    request: serde_json::Value,
-) -> Result<RestoreCodexThreadIndexCheckResult, String> {
-    let request = parse_restore_codex_thread_index_request(request)?;
-    tauri::async_runtime::spawn_blocking(move || check_restore_codex_thread_index_blocking(request))
-        .await
-        .map_err(|error| format!("会话恢复预检查执行失败：{}", error))?
-}
+
+
 
 fn parse_restore_codex_thread_index_request(
     value: serde_json::Value,
@@ -5455,79 +4165,15 @@ fn restore_codex_thread_index_blocking(
     })
 }
 
-#[tauri::command]
-fn toggle_codex_token_auto_renew(enabled: bool) -> Result<AppSettings, String> {
-    let mut settings = load_app_settings()?;
-    settings.token_auto_renew_enabled = enabled;
-    save_app_settings(&settings)?;
-    read_app_settings()
-}
 
-#[tauri::command]
-fn write_app_settings(settings: AppSettingsInput) -> Result<AppSettings, String> {
-    let activation_time = load_app_settings()
-        .ok()
-        .and_then(|current| normalize_app_activation_time(&current.activation_time))
-        .or_else(|| normalize_app_activation_time(&settings.activation_time))
-        .unwrap_or_else(current_app_activation_time);
-    let normalized = AppSettings {
-        system_version: default_system_version(),
-        activation_time,
-        codex_exe_path: settings.codex_exe_path.trim().to_string(),
-        app_restart_target: normalize_restart_target(&settings.app_restart_target),
-        official_proxy_url: settings.official_proxy_url.trim().to_string(),
-        account_usage_refresh_seconds: normalize_account_usage_refresh_seconds(
-            settings.account_usage_refresh_seconds,
-        ),
-        token_auto_renew_enabled: settings.token_auto_renew_enabled,
-        router_port: normalize_port(settings.router_port, default_router_port()),
-        router_concurrency_limit: normalize_router_concurrency_limit(
-            settings.router_concurrency_limit,
-        ),
-        oauth_callback_port: normalize_port(
-            settings.oauth_callback_port,
-            default_oauth_callback_port(),
-        ),
-        router_debug_mode: settings.router_debug_mode,
-        image_generation_compat_mode: settings.image_generation_compat_mode,
-        account_proxy: normalize_account_proxy_settings(
-            settings.account_proxy,
-            normalize_port(settings.oauth_callback_port, default_oauth_callback_port()),
-        ),
-    };
-    save_app_settings(&normalized)?;
-    read_app_settings()
-}
 
-#[tauri::command]
-fn sync_enabled_models_to_catalog() -> Result<SyncCatalogResult, String> {
-    sync_catalog_from_provider_config()
-}
 
-#[tauri::command]
-fn ensure_required_config_files() -> Result<Vec<String>, String> {
-    ensure_workspace_layout()?;
-    ensure_catalog_base_config_file()?;
-    ensure_catalog_config_file()?;
-    ensure_provider_config_file()?;
-    ensure_app_settings_file()?;
 
-    Ok(vec![
-        catalog_base_config_path()?.display().to_string(),
-        catalog_config_path()?.display().to_string(),
-        provider_config_path()?.display().to_string(),
-        app_settings_path()?.display().to_string(),
-    ])
-}
 
-#[tauri::command]
-async fn prepare_router_startup(
-    request: RouterStartupPreparationRequest,
-) -> Result<RouterStartupPreparationResult, String> {
-    tauri::async_runtime::spawn_blocking(move || prepare_router_startup_blocking(request))
-        .await
-        .map_err(|error| format!("Router 启动准备任务执行失败：{}", error))?
-}
+
+
+
+
 
 fn prepare_router_startup_blocking(
     request: RouterStartupPreparationRequest,
@@ -5540,98 +4186,48 @@ fn prepare_router_startup_blocking(
         ));
     }
 
-    let should_restart_codex = request
-        .codex_restart_mode
-        .trim()
-        .eq_ignore_ascii_case("restart");
-    ensure_provider_config_file()?;
-    let sync_catalog_result = sync_catalog_from_provider_config()?;
-    ensure_codex_config_backup()?;
-    let codex_was_running = is_codex_process_running();
-    let (synced_thread_count, skipped_thread_count, synced_thread_message) =
-        sync_codex_history_for_router_start(should_restart_codex, codex_was_running)?;
-    upsert_codex_router_config()?;
-    let mut occupancy = build_port_occupancy_info();
-    let mut killed_port_owner = false;
-
-    if occupancy.occupied {
-        if router_status()?.started && occupancy.pid == Some(std::process::id()) {
-            drop(stop_router_runtime_blocking()?);
-        } else {
-            kill_process_by_port_occupancy(&occupancy)?;
-        }
-
-        killed_port_owner = true;
-        occupancy = build_port_occupancy_info();
-
-        if occupancy.occupied {
-            return Err(format_port_occupancy_error(&occupancy));
-        }
+    let models_cache_path = models_cache_path()?;
+    if !models_cache_path.exists() {
+        return Err(format!(
+            "Codex 模型缓存文件不存在：{}",
+            models_cache_path.display()
+        ));
     }
 
-    let thread_restore_restored_count = synced_thread_count;
-    let thread_restore_skipped_count = skipped_thread_count;
-    let thread_restore_message = synced_thread_message;
-
-    let codex_restart_message = if should_restart_codex {
-        "Codex 已关闭，将在 Router 启动后重新启动。".to_string()
-    } else {
-        "已跳过 Codex 重启。配置已写入，若 Codex 未加载新配置，请稍后手动重启。".to_string()
-    };
+    ensure_provider_config_file()?;
+    let managed_slugs = provider_route_slugs()?;
+    let models_cache_text = fs::read_to_string(&models_cache_path).map_err(|error| {
+        format!(
+            "读取 Codex models_cache.json 失败：{}，路径：{}",
+            error,
+            models_cache_path.display()
+        )
+    })?;
+    let models_cache_root = serde_json::from_str::<serde_json::Value>(&models_cache_text).map_err(|error| {
+        format!(
+            "解析 Codex models_cache.json 失败：{}，路径：{}",
+            error,
+            models_cache_path.display()
+        )
+    })?;
+    let base_root = clean_catalog_root(models_cache_root, &managed_slugs)
+        .ok_or_else(|| "Codex models_cache.json 缺少有效 models 数据".to_string())?;
+    write_catalog_root(&catalog_base_config_path()?, &base_root)?;
+    let sync_catalog_result = sync_catalog_from_provider_config()?;
+    let occupancy = build_port_occupancy_info();
+    let killed_port_owner = false;
 
     Ok(RouterStartupPreparationResult {
+        router_mode: if request.router_mode == 1 { 1 } else { 0 },
         codex_config_path: codex_config_path.display().to_string(),
         catalog_path: catalog_config_path()?.display().to_string(),
         provider_config_path: provider_config_path()?.display().to_string(),
         sync_catalog_result,
         port_occupancy: occupancy,
         killed_port_owner,
-        thread_restore_restored_count,
-        thread_restore_skipped_count,
-        thread_restore_message,
-        codex_restart_attempted: should_restart_codex,
-        codex_restart_message,
     })
 }
 
-fn sync_codex_history_for_router_start(
-    should_restart_codex: bool,
-    codex_was_running: bool,
-) -> Result<(usize, usize, String), String> {
-    if codex_was_running {
-        if !should_restart_codex {
-            return Ok((
-                0,
-                0,
-                "已跳过会话 provider 同步；Codex 正在运行，避免运行中状态覆盖会话数据。"
-                    .to_string(),
-            ));
-        }
-
-        close_codex_process_for_state_write()?;
-        wait_for_codex_process_exit(Duration::from_secs(15))?;
-    }
-
-    let synced_count = sync_codex_history_provider(CODEX_PROVIDER_NAME, true, false)?;
-    cleanup_codex_projectless_workspace_roots()?;
-    let message = if synced_count == 0 {
-        "已切换会话 provider 到 Router；当前没有需要重建的会话索引。".to_string()
-    } else {
-        format!(
-            "已切换 {} 个会话到 Router provider，重启 Codex 后会话应继续显示。",
-            synced_count
-        )
-    };
-
-    Ok((synced_count, 0, message))
-}
-
-#[tauri::command]
-async fn restart_router() -> Result<RouterCommandResult, String> {
-    tauri::async_runtime::spawn_blocking(restart_router_blocking)
-        .await
-        .map_err(|error| format!("重启 Router 任务执行失败：{}", error))?
-}
 
 fn restart_router_blocking() -> Result<RouterCommandResult, String> {
     let was_running = router_status()?.started;
@@ -5651,6 +4247,7 @@ fn restart_router_blocking() -> Result<RouterCommandResult, String> {
 fn router_state() -> &'static Mutex<RouterRuntime> {
     ROUTER_STATE.get_or_init(|| {
         Mutex::new(RouterRuntime {
+            started: false,
             started_at: None,
             stop_signal: None,
             handle: None,
@@ -5971,15 +4568,6 @@ fn close_codex_process_for_state_write() -> Result<(), String> {
     })
 }
 
-fn close_codex_process_for_state_update_if_running() -> Result<(), String> {
-    if !is_codex_process_running() {
-        return Ok(());
-    }
-
-    close_codex_process_for_state_write()?;
-    wait_for_codex_process_exit(Duration::from_secs(15))
-}
-
 fn restart_codex_process_result() -> CodexRestartResult {
     let target = current_restart_target();
     if is_target_process_running(&target) {
@@ -6152,10 +4740,9 @@ fn build_router_result(runtime: &RouterRuntime, status: &str) -> RouterCommandRe
         health_path: HEALTH_PATH.to_string(),
         health_url: format!("http://{}:{}{}", ROUTER_HOST, router_port, HEALTH_PATH),
         uptime_seconds,
-        started: runtime.handle.is_some(),
+        started: runtime.started,
         forwarding_enabled: load_provider_config().is_ok(),
         concurrency_limit: configured_router_concurrency_limit(),
-        codex_restart_message: None,
     }
 }
 
@@ -7031,6 +5618,12 @@ fn build_router_log_entry(
     usage_source: String,
     error_detail: String,
 ) -> RouterLogEntry {
+    let error_detail = if (200..300).contains(&status_code) {
+        EMPTY_LOG_VALUE.to_string()
+    } else {
+        error_detail
+    };
+
     RouterLogEntry {
         time: current_log_time(),
         source_ip: source_ip.to_string(),
@@ -7569,6 +6162,62 @@ fn load_account_proxy_model_ids() -> Vec<String> {
         }
     }
     model_ids
+}
+
+#[derive(serde::Serialize)]
+struct CatalogModelOption {
+    value: String,
+    label: String,
+}
+
+#[tauri::command]
+fn read_catalog_model_options() -> Result<Vec<CatalogModelOption>, String> {
+    let router_mode = load_router_config_command()
+        .map(|config| config.runtime.router_mode)
+        .unwrap_or(0);
+    let path = if router_mode == 1 {
+        catalog_base_config_path()?
+    } else {
+        catalog_config_path()?
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let root = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => value,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let Some(source_models) = root.get(CATALOG_MODELS_KEY).and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut options = Vec::new();
+    for source_model in source_models {
+        let value = source_model
+            .get("id")
+            .or_else(|| source_model.get("slug"))
+            .or_else(|| source_model.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string();
+        if value.is_empty() {
+            continue;
+        }
+        let label = source_model
+            .get("display_name")
+            .or_else(|| source_model.get("displayName"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&value)
+            .to_string();
+        options.push(CatalogModelOption { value, label });
+    }
+
+    Ok(options)
 }
 
 fn account_proxy_responses_request(request: &ParsedRequest) -> RouterResponse {
@@ -8766,11 +7415,7 @@ fn build_synthetic_codex_id_token(auth_root: &serde_json::Value) -> Option<Strin
     ))
 }
 
-fn base64_url_json(value: &serde_json::Value) -> Option<String> {
-    serde_json::to_vec(value)
-        .ok()
-        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-}
+
 
 fn epoch_from_json_time_value(value: &str) -> Option<i64> {
     let trimmed = value.trim();
@@ -10936,7 +9581,7 @@ fn json_chat_message(role: &str, content: &str) -> serde_json::Value {
 
 fn content_to_text(value: &serde_json::Value) -> String {
     match value {
-        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::String(text) => decode_protocol_text_entities(text),
         serde_json::Value::Array(items) => items
             .iter()
             .map(content_to_text)
@@ -10944,13 +9589,15 @@ fn content_to_text(value: &serde_json::Value) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         serde_json::Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(|value| value.as_str()) {
-                return text.to_string();
+            for key in ["text", "input_text", "output_text", "content", "part", "clip"] {
+                if let Some(value) = map.get(key) {
+                    let text = content_to_text(value);
+                    if !text.trim().is_empty() {
+                        return text;
+                    }
+                }
             }
-            if let Some(text) = map.get("content").map(content_to_text) {
-                return text;
-            }
-            serde_json::to_string(value).unwrap_or_default()
+            String::new()
         }
         serde_json::Value::Null => String::new(),
         value => value.to_string(),
@@ -12186,13 +10833,7 @@ fn load_official_codex_forward_settings() -> OfficialCodexForwardSettings {
     OfficialCodexForwardSettings { proxy_url }
 }
 
-fn first_non_empty_value(values: &[String]) -> Option<String> {
-    values
-        .iter()
-        .map(|value| value.trim())
-        .find(|value| !value.is_empty())
-        .map(str::to_string)
-}
+
 
 fn format_official_upstream_error(
     error: &ureq::Error,
@@ -13896,40 +12537,7 @@ fn find_first_account_id(root: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn find_string_by_keys(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in keys {
-                if let Some(found) = map
-                    .get(*key)
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    return Some(found.to_string());
-                }
-            }
 
-            for child in map.values() {
-                if let Some(found) = find_string_by_keys(child, keys) {
-                    return Some(found);
-                }
-            }
-
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if let Some(found) = find_string_by_keys(item, keys) {
-                    return Some(found);
-                }
-            }
-
-            None
-        }
-        _ => None,
-    }
-}
 
 fn load_provider_config() -> Result<RouterProviderConfig, String> {
     ensure_provider_config_file()?;
@@ -13971,7 +12579,18 @@ fn provider_route_slugs() -> Result<HashSet<String>, String> {
 }
 
 fn ensure_provider_config_file() -> Result<(), String> {
-    ensure_json_file(&provider_config_path()?)
+    let path = provider_config_path()?;
+    ensure_parent_dir(&path)?;
+    if !path.exists() {
+        fs::write(&path, "[]").map_err(|error| {
+            format!(
+                "创建 provider 配置文件失败：{}，路径：{}",
+                error,
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn ensure_app_settings_file() -> Result<(), String> {
@@ -14171,6 +12790,7 @@ fn ensure_codex_config_backup() -> Result<(), String> {
 }
 
 fn upsert_codex_router_config() -> Result<(), String> {
+    let settings = load_app_settings()?;
     let path = codex_config_path()?;
     let current_text = fs::read_to_string(&path).map_err(|error| {
         format!(
@@ -14181,7 +12801,7 @@ fn upsert_codex_router_config() -> Result<(), String> {
     })?;
     let cleaned_text = remove_managed_codex_router_block(&current_text);
     let cleaned_text = remove_codex_router_top_level_keys(&cleaned_text);
-    let managed_block = build_codex_router_config_block()?;
+    let managed_block = build_codex_router_config_block(&settings)?;
     let next_text = if cleaned_text.trim().is_empty() {
         managed_block
     } else {
@@ -14342,20 +12962,57 @@ fn parse_toml_key_value(line: &str, key: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-fn build_codex_router_config_block() -> Result<String, String> {
-    let default_model = read_default_router_profile_model()?;
-    let catalog_path = catalog_config_path()?;
-    let router_port = configured_router_port();
+fn build_codex_router_config_block(settings: &AppSettings) -> Result<String, String> {
+    let default_model = if settings.router_default_model.trim().is_empty() {
+        read_default_router_profile_model()?
+    } else {
+        settings.router_default_model.trim().to_string()
+    };
+    let catalog_path = if settings.router_model_catalog_json.trim().is_empty() {
+        catalog_config_path()?.display().to_string()
+    } else {
+        settings.router_model_catalog_json.trim().to_string()
+    };
+    let base_url = if settings.router_mode == "system" {
+        format!("http://{}:{}/v1", ROUTER_HOST, configured_router_port())
+    } else if settings.router_base_url.trim().is_empty() {
+        format!("http://{}:{}/v1", ROUTER_HOST, configured_router_port())
+    } else {
+        settings.router_base_url.trim().to_string()
+    };
+    let provider = CODEX_PROVIDER_NAME;
+    let provider_display_name = if settings.router_name.trim().is_empty() {
+        CODEX_MODEL_PROVIDER_NAME.to_string()
+    } else {
+        settings.router_name.trim().to_string()
+    };
+
+    let auth_method = settings.router_auth_method.trim();
+    let external_token = settings.router_auth_external_token.trim();
+    let env_key = settings.router_auth_env_key.trim();
+
+    let auth_block = match auth_method {
+        "external" => format!(
+            "#直接指定外部key形式\nexperimental_bearer_token = \"{}\"",
+            toml_basic_string(external_token)
+        ),
+        "env" => format!(
+            "#配置自定义模型apikey形式\nenv_key = \"{}\"",
+            toml_basic_string(env_key)
+        ),
+        _ => "#官方常规登录形式\nrequires_openai_auth = true".to_string(),
+    };
+
     Ok(format!(
-        "{start}\nmodel_provider = \"{provider}\"\nmodel = \"{model}\"\nmodel_catalog_json = \"{catalog_path}\"\nmodel_providers.\"{provider}\".name = \"{provider_display_name}\"\nmodel_providers.\"{provider}\".base_url = \"http://{host}:{port}/codex/router/v1\"\nmodel_providers.\"{provider}\".wire_api = \"{wire_api}\"\nmodel_providers.\"{provider}\".requires_openai_auth = true\n{end}",
+        "{start}\nmodel_provider = \"{provider}\"\nmodel = \"{model}\"\nmodel_catalog_json = \"{catalog_path}\"\n\n[model_providers.{provider}]\nname = \"{name}\"\nbase_url = \"{base_url}\"\nwire_api = \"{wire_api}\"\n{auth_block}\n{end}",
         start = CODEX_ROUTER_TOP_MANAGED_START_MARKER,
-        provider = CODEX_PROVIDER_NAME,
+        provider = provider,
         model = toml_basic_string(&default_model),
-        catalog_path = toml_basic_string(&catalog_path.display().to_string()),
-        provider_display_name = CODEX_MODEL_PROVIDER_NAME,
-        host = ROUTER_HOST,
-        port = router_port,
+        name = toml_basic_string(&provider_display_name),
+        base_url = toml_basic_string(&base_url),
         wire_api = CODEX_WIRE_API,
+        auth_block = auth_block,
+        catalog_path = toml_basic_string(&catalog_path),
         end = CODEX_ROUTER_TOP_MANAGED_END_MARKER,
     ))
 }
@@ -14414,251 +13071,77 @@ fn read_first_official_model_display_name() -> Result<String, String> {
         })
 }
 
-fn ensure_json_file(path: &PathBuf) -> Result<(), String> {
-    ensure_parent_dir(path)?;
 
-    if !path.exists() {
-        fs::write(path, EMPTY_JSON_OBJECT_CONTENT).map_err(|error| {
-            format!(
-                "鍒涘缓 JSON 閰嶇疆鏂囦欢澶辫触：{}锛岃矾寰勶細{}",
-                error,
-                path.display()
-            )
-        })?;
-    }
 
-    Ok(())
-}
 
-fn provider_config_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CONFIG_RELATIVE_PATH)
-}
 
-fn workspace_backup_sessions_path() -> Result<PathBuf, String> {
-    Ok(workspace_backup_path()?.join("sessions"))
-}
 
-fn model_config_backups_path() -> Result<PathBuf, String> {
-    Ok(workspace_backup_path()?.join("models"))
-}
 
-fn backup_provider_config_before_import(path: &Path) -> Result<Option<PathBuf>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
 
-    let backup_dir = model_config_backups_path()?;
-    fs::create_dir_all(&backup_dir).map_err(|error| {
-        format!(
-            "创建模型备份目录失败：{}，路径：{}",
-            error,
-            backup_dir.display()
-        )
-    })?;
-    let backup_path = backup_dir.join(format!(
-        "router_provider_config-before-import-{}.json",
-        current_log_time()
-    ));
-    fs::copy(path, &backup_path).map_err(|error| {
-        format!(
-            "备份当前模型配置失败：{}，源路径：{}，目标路径：{}",
-            error,
-            path.display(),
-            backup_path.display()
-        )
-    })?;
 
-    Ok(Some(backup_path))
-}
 
-fn workspace_backup_path() -> Result<PathBuf, String> {
-    build_user_relative_path(WORKSPACE_BACKUP_RELATIVE_PATH)
-}
 
-fn ensure_workspace_layout() -> Result<(), String> {
-    for relative_path in [
-        WORKSPACE_RELATIVE_PATH,
-        WORKSPACE_CONFIG_RELATIVE_PATH,
-        WORKSPACE_LOGS_APP_RELATIVE_PATH,
-        WORKSPACE_LOGS_ROUTER_RELATIVE_PATH,
-        WORKSPACE_BACKUP_RELATIVE_PATH,
-        WORKSPACE_CACHE_RELATIVE_PATH,
-        WORKSPACE_RUNTIME_RELATIVE_PATH,
-        WORKSPACE_ACCOUNTS_RELATIVE_PATH,
-    ] {
-        let path = build_user_relative_path(relative_path)?;
-        fs::create_dir_all(&path).map_err(|error| {
-            format!(
-                "创建 ai-router workspace 目录失败：{}，路径：{}",
-                error,
-                path.display()
-            )
-        })?;
-    }
 
-    fs::create_dir_all(workspace_backup_sessions_path()?)
-        .map_err(|error| format!("创建会话备份目录失败：{}", error))?;
-    fs::create_dir_all(codex_accounts_backups_path()?)
-        .map_err(|error| format!("创建账号备份目录失败：{}", error))?;
-    fs::create_dir_all(codex_accounts_snapshots_path()?)
-        .map_err(|error| format!("创建账号快照目录失败：{}", error))?;
 
-    Ok(())
-}
 
-fn models_cache_path() -> Result<PathBuf, String> {
-    build_user_relative_path(MODELS_CACHE_RELATIVE_PATH)
-}
 
-fn catalog_base_config_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CATALOG_BASE_RELATIVE_PATH)
-}
 
-fn catalog_config_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CATALOG_RELATIVE_PATH)
-}
 
-fn app_log_path() -> Result<PathBuf, String> {
-    build_user_relative_path(APP_LOG_RELATIVE_PATH)
-}
 
-fn account_proxy_log_path() -> Result<PathBuf, String> {
-    build_user_relative_path(ACCOUNT_PROXY_LOG_RELATIVE_PATH)
-}
 
-fn router_log_path() -> Result<PathBuf, String> {
-    build_user_relative_path(ROUTER_LOG_RELATIVE_PATH)
-}
 
-fn router_debug_log_path() -> Result<PathBuf, String> {
-    build_user_relative_path(ROUTER_DEBUG_LOG_RELATIVE_PATH)
-}
 
-fn router_full_debug_log_path() -> Result<PathBuf, String> {
-    build_user_relative_path(ROUTER_FULL_DEBUG_LOG_RELATIVE_PATH)
-}
 
-fn app_settings_path() -> Result<PathBuf, String> {
-    build_user_relative_path(APP_SETTINGS_RELATIVE_PATH)
-}
 
-fn codex_config_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_CONFIG_RELATIVE_PATH)
-}
 
-fn codex_auth_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_AUTH_RELATIVE_PATH)
-}
 
-fn codex_plugins_cache_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_PLUGINS_CACHE_RELATIVE_PATH)
-}
 
-fn codex_plugin_state_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_PLUGIN_STATE_RELATIVE_PATH)
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #[allow(dead_code)]
-fn codex_global_state_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_GLOBAL_STATE_RELATIVE_PATH)
-}
+
 
 #[allow(dead_code)]
-fn codex_global_state_backup_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_GLOBAL_STATE_BACKUP_RELATIVE_PATH)
-}
 
-fn codex_accounts_registry_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_ACCOUNTS_REGISTRY_RELATIVE_PATH)
-}
 
-fn codex_accounts_backups_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_ACCOUNTS_BACKUPS_RELATIVE_PATH)
-}
 
-fn codex_accounts_snapshots_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_ACCOUNTS_SNAPSHOTS_RELATIVE_PATH)
-}
 
-fn codex_sessions_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_SESSIONS_RELATIVE_PATH)
-}
 
-fn codex_archived_sessions_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_ARCHIVED_SESSIONS_RELATIVE_PATH)
-}
 
-fn codex_session_index_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_SESSION_INDEX_RELATIVE_PATH)
-}
 
-fn codex_state_db_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_STATE_DB_RELATIVE_PATH)
-}
 
-fn codex_skills_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_SKILLS_RELATIVE_PATH)
-}
 
-fn skill_backups_path() -> Result<PathBuf, String> {
-    Ok(workspace_backup_path()?.join("skills"))
-}
 
-fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf, String> {
-    if !path.exists() {
-        return Ok(path.to_path_buf());
-    }
 
-    path.canonicalize()
-        .map_err(|error| format!("解析目录路径失败：{}，路径：{}", error, path.display()))
-}
 
-fn codex_config_backup_path() -> Result<PathBuf, String> {
-    build_user_relative_path(CODEX_CONFIG_BACKUP_RELATIVE_PATH)
-}
 
-fn build_user_relative_path(relative_path: &[&str]) -> Result<PathBuf, String> {
-    let mut path = user_home_path()?;
 
-    for segment in relative_path {
-        path.push(segment);
-    }
 
-    Ok(path)
-}
 
-fn remove_dir_contents(dir: &Path, label: &str) -> Result<CleanCount, String> {
-    assert_safe_cleanup_root(dir)?;
 
-    if !dir.exists() {
-        return Ok(CleanCount::default());
-    }
 
-    let mut result = CleanCount::default();
-    let entries = fs::read_dir(dir)
-        .map_err(|error| format!("读取{}失败：{}，路径：{}", label, error, dir.display()))?;
 
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("读取{}条目失败：{}", label, error))?;
-        let path = entry.path();
-        let size = path_total_size(&path);
 
-        if path.is_dir() {
-            fs::remove_dir_all(&path).map_err(|error| {
-                format!("清理{}失败：{}，路径：{}", label, error, path.display())
-            })?;
-        } else {
-            fs::remove_file(&path).map_err(|error| {
-                format!("清理{}失败：{}，路径：{}", label, error, path.display())
-            })?;
-        }
 
-        result.count += 1;
-        result.bytes += size;
-    }
 
-    Ok(result)
-}
+
+
+
+
+
 
 fn clean_invalid_account_snapshots() -> Result<CleanCount, String> {
     let snapshots_dir = codex_accounts_snapshots_path()?;
@@ -14722,76 +13205,15 @@ fn clean_invalid_account_snapshots() -> Result<CleanCount, String> {
     Ok(result)
 }
 
-fn remove_file_counted(path: &Path, label: &str) -> Result<CleanCount, String> {
-    let bytes = fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
-    fs::remove_file(path)
-        .map_err(|error| format!("清理{}失败：{}，路径：{}", label, error, path.display()))?;
-    Ok(CleanCount { count: 1, bytes })
-}
 
-fn path_total_size(path: &Path) -> u64 {
-    let Ok(metadata) = fs::metadata(path) else {
-        return 0;
-    };
 
-    if metadata.is_file() {
-        return metadata.len();
-    }
 
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
-    };
 
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| path_total_size(&entry.path()))
-        .sum()
-}
 
-fn assert_safe_cleanup_root(path: &Path) -> Result<(), String> {
-    let workspace = workspace_backup_path()?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "无法解析工作区目录".to_string())?;
-    let codex_snapshots = codex_accounts_snapshots_path()?;
-    let allowed_roots = [workspace, codex_snapshots];
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-    if allowed_roots.iter().any(|root| {
-        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        canonical_path.starts_with(canonical_root)
-    }) {
-        return Ok(());
-    }
 
-    Err(format!("拒绝清理非应用工作区路径：{}", path.display()))
-}
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-    let value = bytes as f64;
-    if value >= GB {
-        format!("{:.2} GB", value / GB)
-    } else if value >= MB {
-        format!("{:.2} MB", value / MB)
-    } else if value >= KB {
-        format!("{:.2} KB", value / KB)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-fn user_home_path() -> Result<PathBuf, String> {
-    env::var("USERPROFILE")
-        .or_else(|_| env::var("HOME"))
-        .map(PathBuf::from)
-        .map_err(|_| "无法读取用户目录环境变量 USERPROFILE/HOME".to_string())
-}
 
 fn read_mcp_servers_from_config(config_path: &Path) -> Result<Vec<McpServerSummary>, String> {
     if !config_path.exists() {
@@ -15640,30 +14062,7 @@ fn backup_skill_directory(
     })
 }
 
-fn copy_dir_all(source: &Path, target: &Path) -> Result<(), String> {
-    fs::create_dir_all(target)
-        .map_err(|error| format!("创建目录失败：{}，路径：{}", error, target.display()))?;
-    let entries = fs::read_dir(source)
-        .map_err(|error| format!("读取目录失败：{}，路径：{}", error, source.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("读取目录项失败：{}", error))?;
-        let path = entry.path();
-        let dest = target.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_all(&path, &dest)?;
-        } else {
-            fs::copy(&path, &dest).map_err(|error| {
-                format!(
-                    "复制文件失败：{}，来源：{}，目标：{}",
-                    error,
-                    path.display(),
-                    dest.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
+
 
 fn sanitize_path_segment(value: &str) -> String {
     let sanitized: String = value
@@ -15683,24 +14082,11 @@ fn sanitize_path_segment(value: &str) -> String {
         .collect::<String>()
 }
 
-fn current_unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
-}
 
-fn system_time_to_unix_millis(value: SystemTime) -> Option<i64> {
-    value
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-}
 
-fn unix_millis_to_system_time(value: i64) -> Option<SystemTime> {
-    let millis = u64::try_from(value).ok()?;
-    Some(UNIX_EPOCH + Duration::from_millis(millis))
-}
+
+
+
 
 fn hidden_command(program: &str) -> Command {
     let mut command = Command::new(program);
@@ -15841,9 +14227,11 @@ fn parse_thread_session_file(
             let payload_type = payload.get("type").and_then(|item| item.as_str());
             let role = payload.get("role").and_then(|item| item.as_str());
 
-            if payload_type == Some("thread_name_updated") {
-                if let Some(name) =
-                    json_string_field(payload, "thread_name").filter(|name| !name.trim().is_empty())
+            if payload_type.map(is_thread_title_event).unwrap_or(false) {
+                if let Some(name) = ["thread_name", "threadName", "title", "name"]
+                    .iter()
+                    .find_map(|key| json_string_field(payload, key))
+                    .filter(|name| valid_title(name).is_some())
                 {
                     thread_name = Some(truncate_text(&name, MAX_THREAD_TITLE_CHARS));
                 }
@@ -15855,10 +14243,13 @@ fn parse_thread_session_file(
 
             if payload_type == Some("message") && role == Some("user") && first_user_text.is_none()
             {
-                if let Some(text) =
-                    extract_message_text(payload).filter(|text| is_real_user_text(text))
-                {
-                    first_user_text = Some(truncate_text(&text, MAX_THREAD_TITLE_CHARS));
+                if let Some(text) = extract_title_text(payload) {
+                    let candidate = extract_real_user_request(&text).or_else(|| {
+                        (!is_synthetic_user_message(&text)).then(|| text.clone())
+                    });
+                    if let Some(candidate) = candidate.filter(|text| is_real_user_text(text)) {
+                        first_user_text = Some(truncate_text(&candidate, MAX_THREAD_TITLE_CHARS));
+                    }
                 }
             }
         }
@@ -15879,12 +14270,12 @@ fn parse_thread_session_file(
         thread_session_state_needs_repair(path, &id, cwd.as_deref(), archived, index_info);
     let sqlite_thread = index_info.sqlite_threads.get(&id);
     let title = sqlite_thread
-        .and_then(|thread| non_empty_string(&thread.title))
-        .or_else(|| sqlite_thread.and_then(|thread| non_empty_string(&thread.first_user_message)))
-        .or_else(|| index_info.titles.get(&id).cloned())
-        .or_else(|| thread_name.clone())
-        .or_else(|| first_user_text.clone())
-        .unwrap_or_else(|| truncate_text(&id, MAX_THREAD_TITLE_CHARS));
+        .and_then(|thread| valid_title(&thread.title))
+        .or_else(|| index_info.titles.get(&id).and_then(|title| valid_title(title)))
+        .or_else(|| thread_name.as_deref().and_then(valid_title))
+        .or_else(|| first_user_text.as_deref().and_then(valid_title))
+        .or_else(|| sqlite_thread.and_then(|thread| valid_title(&thread.first_user_message)))
+        .unwrap_or_else(|| "未命名会话".to_string());
     let project_name = project_name_from_cwd(cwd.as_deref());
     let updated_at =
         latest_timestamp.or_else(|| metadata.modified().ok().map(system_time_to_unix_string));
@@ -15914,6 +14305,150 @@ fn parse_thread_session_file(
 }
 
 #[allow(dead_code)]
+fn is_synthetic_user_message(content: &str) -> bool {
+    let value = content.trim().to_lowercase();
+    value.starts_with("# files pasted by the user:")
+        || value.starts_with("# files mentioned by the user:")
+        || value.starts_with("# files attached by the user:")
+        || value.contains("the attached pasted text file(s) contain the user's request")
+        || value.contains("the attached file(s) contain the user's request")
+}
+
+fn decode_protocol_text_entities(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(relative_start) = text[index..].find('&') {
+        let start = index + relative_start;
+        result.push_str(&text[index..start]);
+        let Some(relative_end) = text[start..].find(';') else {
+            result.push_str(&text[start..]);
+            index = text.len();
+            break;
+        };
+        let end = start + relative_end;
+        let entity = &text[start..=end];
+        let decoded = match entity {
+            "&#x20;" | "&#X20;" | "&nbsp;" => Some(' '),
+            "&amp;" => Some('&'),
+            "&lt;" => Some('<'),
+            "&gt;" => Some('>'),
+            "&quot;" => Some('"'),
+            "&#39;" | "&apos;" => Some('\''),
+            _ => entity
+                .strip_prefix("&#x")
+                .or_else(|| entity.strip_prefix("&#X"))
+                .and_then(|value| value.strip_suffix(';'))
+                .and_then(|value| u32::from_str_radix(value, 16).ok())
+                .and_then(char::from_u32)
+                .or_else(|| entity.strip_prefix("&#").and_then(|value| value.strip_suffix(';')).and_then(|value| value.parse::<u32>().ok()).and_then(char::from_u32)),
+        };
+        result.push_str(&decoded.map(|value| value.to_string()).unwrap_or_else(|| entity.to_string()));
+        index = end + 1;
+    }
+    if index < text.len() {
+        result.push_str(&text[index..]);
+    }
+    result
+}
+
+fn normalize_protocol_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = decode_protocol_text_entities(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(normalize_protocol_value),
+        serde_json::Value::Object(map) => map.values_mut().for_each(normalize_protocol_value),
+        _ => {}
+    }
+}
+
+fn extract_title_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(decode_protocol_text_entities(text)),
+        serde_json::Value::Array(items) => {
+            let text = items.iter().filter_map(extract_title_text).filter(|text| !text.trim().is_empty()).collect::<Vec<_>>().join(" ");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        serde_json::Value::Object(map) => {
+            ["text", "input_text", "output_text", "content", "part", "clip"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(extract_title_text))
+        }
+        _ => None,
+    }
+}
+
+fn decode_title_entities(text: &str) -> String {
+    decode_protocol_text_entities(text)
+}
+
+
+fn is_thread_title_event(event_type: &str) -> bool {
+    let value = event_type.to_lowercase();
+    value.contains("thread_name")
+        || value.contains("threadname")
+        || value.contains("title_updated")
+        || value.contains("titleupdated")
+        || value.contains("thread_renamed")
+        || value.contains("threadrenamed")
+}
+
+fn extract_real_user_request(content: &str) -> Option<String> {
+    let markers = ["## my request for codex:", "my request for codex:", "user request:", "request:"];
+    let lower = content.to_lowercase();
+    markers.iter().find_map(|marker| {
+        let index = lower.find(marker)?;
+        let request = content[index + marker.len()..].trim();
+        (!request.is_empty() && !is_log_like_text(request)).then(|| normalize_fallback_title(request))
+    })
+}
+
+fn valid_title(value: &str) -> Option<String> {
+    let normalized = normalize_fallback_title(value);
+    if normalized.is_empty() || normalized.eq_ignore_ascii_case("untitled") || is_synthetic_user_message(&normalized) || is_log_like_text(&normalized) {
+        return None;
+    }
+    Some(truncate_text(&normalized, MAX_THREAD_TITLE_CHARS))
+}
+
+fn normalize_fallback_title(value: &str) -> String {
+    let mut text = decode_title_entities(value)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("```") && !line.ends_with("```"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    text = text.trim().to_string();
+    for prefix in ["### ", "## ", "# "] {
+        if text.starts_with(prefix) {
+            text = text[prefix.len()..].trim_start().to_string();
+            break;
+        }
+    }
+    for (open, close) in [("**", "**"), ("__", "__"), ("~~", "~~"), ("`", "`"), ("*", "*"), ("_", "_")] {
+        if text.len() >= open.len() + close.len() && text.starts_with(open) && text.ends_with(close) {
+            text = text[open.len()..text.len() - close.len()].trim().to_string();
+            break;
+        }
+    }
+    text.chars()
+        .map(|character| match character {
+            '\u{00a0}' | '\u{2002}' | '\u{2003}' | '\u{2009}' | '\u{3000}' | '\n' | '\r' | '\t' => ' ',
+            value => value,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_log_like_text(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    value.len() > 500 || value.lines().count() > 8 || lower.contains("openjdk 64-bit server vm warning:") || lower.contains("exception in thread") || lower.contains("stack trace")
+}
+
+fn is_real_user_text(value: &str) -> bool {
+    if is_synthetic_user_message(value) { extract_real_user_request(value).is_some() } else { valid_title(value).is_some() }
+}
+
 fn read_thread_id_from_jsonl(path: &Path) -> Result<Option<String>, String> {
     let file = fs::File::open(path).map_err(|error| {
         format!(
@@ -17814,11 +16349,7 @@ fn verify_thread_restore_global_state_file(
     }
 }
 
-fn ensure_json_object(value: &mut serde_json::Value) {
-    if !value.is_object() {
-        *value = serde_json::json!({});
-    }
-}
+
 
 fn thread_ids_from_order(value: &serde_json::Value) -> Vec<String> {
     if let Some(items) = value.as_array() {
@@ -17949,54 +16480,15 @@ fn load_sqlite_thread_state_map() -> Result<HashMap<String, SqliteThreadState>, 
         .map_err(|error| format!("read sqlite thread state failed: {}", error))
 }
 
-fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
-    value
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(ToString::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
-fn unique_strings(values: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut unique = Vec::new();
-    for value in values {
-        if seen.insert(value.clone()) {
-            unique.push(value);
-        }
-    }
-    unique
-}
 
-fn front_unique(existing: Vec<String>, front: Vec<String>) -> Vec<String> {
-    let mut combined = Vec::with_capacity(existing.len() + front.len());
-    combined.extend(front);
-    combined.extend(existing);
-    unique_strings(combined)
-}
 
-fn append_unique(existing: Vec<String>, additions: Vec<String>) -> Vec<String> {
-    let mut combined = Vec::with_capacity(existing.len() + additions.len());
-    combined.extend(existing);
-    combined.extend(additions);
-    unique_strings(combined)
-}
 
-fn merge_ordered_unique(
-    existing: Vec<String>,
-    additions: Vec<String>,
-    move_to_recent: bool,
-) -> Vec<String> {
-    if move_to_recent {
-        front_unique(existing, additions)
-    } else {
-        append_unique(existing, additions)
-    }
-}
+
+
+
+
+
 
 fn project_path_variants(projects: &[String]) -> Vec<String> {
     let mut variants = Vec::new();
@@ -18559,19 +17051,9 @@ fn extract_message_text(payload: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(ToString::to_string)
-}
 
-fn read_json_file_optional(path: &Path) -> Option<serde_json::Value> {
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<serde_json::Value>(&text).ok()
-}
+
+
 
 fn usage_window_from_value(value: &serde_json::Value) -> Option<CodexUsageWindow> {
     if value.is_null() {
@@ -19699,6 +18181,11 @@ fn refresh_account_usage_from_backend_api_inner(
         manual,
         &mut usage_error_detail,
     ) else {
+        set_account_usage_last_error(
+            usage_error_detail
+                .clone()
+                .unwrap_or_else(|| "未返回有效额度数据".to_string()),
+        );
         if manual {
             let error_detail = usage_error_detail.as_deref().unwrap_or("(no detail)");
             append_internal_app_log(
@@ -19739,6 +18226,23 @@ fn refresh_account_usage_from_backend_api_inner(
     updated
 }
 
+fn set_account_usage_last_error(detail: String) {
+    if let Ok(mut error) = ACCOUNT_USAGE_LAST_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *error = Some(truncate_text(&detail, 240));
+    }
+}
+
+fn take_account_usage_last_error() -> Option<String> {
+    ACCOUNT_USAGE_LAST_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut error| error.take())
+}
+
 fn refresh_active_account_usage_from_backend_api() -> Result<bool, String> {
     let mut registry = read_accounts_registry()?;
     let Some(account_key) =
@@ -19761,34 +18265,89 @@ fn fetch_codex_usage_from_backend_api(
     manual: bool,
     collect_error: &mut Option<String>,
 ) -> Option<CodexUsageSnapshot> {
-    let mut wham_error: Option<String> = None;
-    let mut codex_error: Option<String> = None;
-    let result = fetch_codex_usage_from_url(
-        OFFICIAL_WHAM_USAGE_URL,
-        access_token,
-        account_id,
-        manual,
-        &mut wham_error,
-    );
-    if result.is_some() {
-        return result;
-    }
-    let result = fetch_codex_usage_from_url(
+    fetch_codex_usage_from_url(
         OFFICIAL_CODEX_USAGE_URL,
         access_token,
         account_id,
         manual,
-        &mut codex_error,
-    );
-    if result.is_some() {
-        return result;
+        collect_error,
+    )
+}
+
+#[tauri::command]
+async fn sync_official_catalog() -> Result<Vec<CatalogModelOption>, String> {
+    tauri::async_runtime::spawn_blocking(sync_official_catalog_blocking)
+        .await
+        .map_err(|error| format!("同步官方模型任务执行失败：{}", error))?
+}
+
+fn sync_official_catalog_blocking() -> Result<Vec<CatalogModelOption>, String> {
+    let auth_root = read_json_file_optional(&codex_auth_path()?);
+    let (access_token, account_id) = if let Ok(registry) = read_accounts_registry() {
+        let account_key = registry
+            .get("activeAccountKey")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty());
+        let account = account_key.and_then(|key| find_registry_account(&registry, key));
+        let snapshot = account
+            .as_ref()
+            .and_then(|item| json_string_field(item, "snapshotPath"))
+            .and_then(|path| read_json_file_optional(Path::new(&path)));
+        let token = snapshot.as_ref().and_then(find_codex_access_token)
+            .or_else(|| auth_root.as_ref().and_then(find_codex_access_token));
+        let id = snapshot.as_ref().and_then(find_codex_account_id)
+            .or_else(|| auth_root.as_ref().and_then(find_codex_account_id))
+            .or_else(|| account_key.map(str::to_string));
+        (token, id)
+    } else {
+        (
+            auth_root.as_ref().and_then(find_codex_access_token),
+            auth_root.as_ref().and_then(find_codex_account_id),
+        )
+    };
+    let access_token = access_token.ok_or_else(|| "未找到当前账号的访问令牌".to_string())?;
+    let account_id = account_id.ok_or_else(|| "未找到当前账号的 ChatGPT-Account-Id".to_string())?;
+    let settings = load_official_codex_forward_settings();
+    let request = match settings.proxy_url.as_deref().and_then(|url| ureq::Proxy::new(url).ok()) {
+        Some(proxy) => ureq::builder().proxy(proxy).build().get(OFFICIAL_CODEX_MODELS_URL),
+        None => ureq::get(OFFICIAL_CODEX_MODELS_URL),
     }
-    *collect_error = Some(format!(
-        "wham: {}, codex: {}",
-        wham_error.as_deref().unwrap_or("(no detail)"),
-        codex_error.as_deref().unwrap_or("(no detail)")
-    ));
-    None
+        .timeout(Duration::from_secs(ACCOUNT_USAGE_REQUEST_TIMEOUT_SECONDS))
+        .set(HEADER_AUTHORIZATION, &format!("Bearer {}", access_token))
+        .set(HEADER_CHATGPT_ACCOUNT_ID, &account_id)
+        .set("Host", "chatgpt.com")
+        .set(HEADER_ACCEPT, HEADER_JSON);
+    let response = request.call().map_err(|error| {
+        append_account_usage_router_log(
+            OFFICIAL_CODEX_MODELS_URL,
+            &account_id,
+            "error",
+            Some(&error.to_string()),
+        );
+        format!("同步官方模型失败：{}", error)
+    })?;
+    if !(200..300).contains(&response.status()) {
+        append_account_usage_router_log(
+            OFFICIAL_CODEX_MODELS_URL,
+            &account_id,
+            &response.status().to_string(),
+            None,
+        );
+        return Err(format!("同步官方模型失败，HTTP 状态码：{}", response.status()));
+    }
+    append_account_usage_router_log(
+        OFFICIAL_CODEX_MODELS_URL,
+        &account_id,
+        &response.status().to_string(),
+        None,
+    );
+    let body = response.into_string().map_err(|error| format!("读取官方模型响应失败：{}", error))?;
+    let root = serde_json::from_str::<serde_json::Value>(&body).map_err(|error| format!("解析官方模型响应失败：{}", error))?;
+    if root.get(CATALOG_MODELS_KEY).and_then(|value| value.as_array()).is_none() {
+        return Err("官方模型响应缺少 models 数组".to_string());
+    }
+    write_catalog_root(&catalog_base_config_path()?, &root)?;
+    read_catalog_model_options()
 }
 
 fn fetch_codex_usage_from_url(
@@ -19800,26 +18359,7 @@ fn fetch_codex_usage_from_url(
 ) -> Option<CodexUsageSnapshot> {
     let settings = load_official_codex_forward_settings();
     let authorization = format!("Bearer {}", access_token);
-    let body = send_codex_usage_request(
-        "GET",
-        url,
-        &authorization,
-        account_id,
-        &settings,
-        manual,
-        collect_error,
-    )
-    .or_else(|| {
-        send_codex_usage_request(
-            "POST",
-            url,
-            &authorization,
-            account_id,
-            &settings,
-            manual,
-            collect_error,
-        )
-    })?;
+    let body = send_codex_usage_request(url, &authorization, account_id, &settings, manual, collect_error)?;
     let root = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(root) => root,
         Err(error) => {
@@ -19874,7 +18414,6 @@ fn fetch_codex_usage_from_url(
 }
 
 fn send_codex_usage_request(
-    method: &str,
     url: &str,
     authorization: &str,
     account_id: &str,
@@ -19889,17 +18428,16 @@ fn send_codex_usage_request(
         },
         None => None,
     };
-    let request = match (method, agent.as_ref()) {
-        ("POST", Some(agent)) => agent.post(url),
-        ("POST", None) => ureq::post(url),
-        (_, Some(agent)) => agent.get(url),
-        _ => ureq::get(url),
+    let request = match agent.as_ref() {
+        Some(agent) => agent.get(url),
+        None => ureq::get(url),
     }
     .timeout(Duration::from_secs(ACCOUNT_USAGE_REQUEST_TIMEOUT_SECONDS))
     .set(HEADER_ACCEPT, HEADER_JSON)
     .set(HEADER_CONTENT_TYPE, HEADER_JSON)
     .set(HEADER_AUTHORIZATION, authorization)
     .set(HEADER_CHATGPT_ACCOUNT_ID, account_id)
+    .set("Host", "chatgpt.com")
     .set(HEADER_OPENAI_BETA, OFFICIAL_CODEX_BETA_HEADER_VALUE)
     .set(HEADER_ORIGINATOR, OFFICIAL_CODEX_ORIGINATOR)
     .set(HEADER_ORIGIN, "https://chatgpt.com")
@@ -19913,22 +18451,23 @@ fn send_codex_usage_request(
             "refresh-usage",
             "发送额度刷新请求",
             Some(format!(
-                "method={}, url={}, account={}",
-                method,
+                "method=GET, url={}, account={}",
                 url,
                 mask_secret(account_id)
             )),
         );
     }
 
-    let response = if method == "POST" {
-        request.send_string("{}")
-    } else {
-        request.call()
-    };
+    let response = request.call();
 
     let response = match response {
         Ok(response) => {
+            append_account_usage_router_log(
+                url,
+                account_id,
+                &response.status().to_string(),
+                None,
+            );
             if should_log_verbose_account_usage_refresh(manual) {
                 append_internal_app_log(
                     "info",
@@ -19936,8 +18475,7 @@ fn send_codex_usage_request(
                     "refresh-usage",
                     "额度刷新请求返回",
                     Some(format!(
-                        "method={}, url={}, account={}, status={}",
-                        method,
+                        "method=GET, url={}, account={}, status={}",
                         url,
                         mask_secret(account_id),
                         response.status()
@@ -19947,8 +18485,7 @@ fn send_codex_usage_request(
             let status = response.status();
             if !(200..300).contains(&status) {
                 *collect_error = Some(format!(
-                    "method={}, url={}, account={}, status={}",
-                    method,
+                    "method=GET, url={}, account={}, status={}",
                     url,
                     mask_secret(account_id),
                     status
@@ -19960,8 +18497,7 @@ fn send_codex_usage_request(
                         "refresh-usage",
                         "额度接口返回非成功状态",
                         Some(format!(
-                            "method={}, url={}, account={}, status={}",
-                            method,
+                            "method=GET, url={}, account={}, status={}",
                             url,
                             mask_secret(account_id),
                             status
@@ -19973,9 +18509,9 @@ fn send_codex_usage_request(
             response
         }
         Err(error) => {
+            append_account_usage_router_log(url, account_id, "error", Some(&error.to_string()));
             *collect_error = Some(format!(
-                "method={}, url={}, account={}, error={}",
-                method,
+                "method=GET, url={}, account={}, error={}",
                 url,
                 mask_secret(account_id),
                 error
@@ -19987,8 +18523,7 @@ fn send_codex_usage_request(
                     "refresh-usage",
                     "请求额度接口失败",
                     Some(format!(
-                        "method={}, url={}, account={}, error={}",
-                        method,
+                        "method=GET, url={}, account={}, error={}",
                         url,
                         mask_secret(account_id),
                         error
@@ -20007,8 +18542,7 @@ fn send_codex_usage_request(
             "refresh-usage",
             "额度刷新响应内容",
             Some(format!(
-                "method={}, url={}, account={}, body={}",
-                method,
+                "method=GET, url={}, account={}, body={}",
                 url,
                 mask_secret(account_id),
                 truncate_text(&body, 1200)
@@ -20416,66 +18950,21 @@ fn backup_current_auth_file() -> Result<(), String> {
     Ok(())
 }
 
-fn json_number_or_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
-    value.get(key).and_then(|item| {
-        if let Some(text) = item.as_str() {
-            return Some(text.to_string());
-        }
-        if let Some(number) = item.as_i64() {
-            return Some(number.to_string());
-        }
-        item.as_u64().map(|number| number.to_string())
-    })
-}
 
-fn json_u64_number_field(value: &serde_json::Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(|item| {
-        if let Some(number) = item.as_u64() {
-            return Some(number);
-        }
-        item.as_str()?.trim().parse::<u64>().ok()
-    })
-}
 
-fn find_u8_by_keys(value: &serde_json::Value, keys: &[&str]) -> Option<u8> {
-    for key in keys {
-        if let Some(number) = value.get(*key).and_then(|item| item.as_u64()) {
-            return Some(number.min(100) as u8);
-        }
-    }
 
-    None
-}
+
+
 
 fn find_codex_access_token(root: &serde_json::Value) -> Option<String> {
     find_string_by_keys(root, CODEX_ACCESS_TOKEN_KEYS)
 }
 
-fn mask_secret(secret: &str) -> String {
-    let trimmed = secret.trim();
-    if trimmed.len() <= 12 {
-        return "****".to_string();
-    }
 
-    format!("{}...{}", &trimmed[..8], &trimmed[trimmed.len() - 4..])
-}
 
-fn is_real_user_text(text: &str) -> bool {
-    !text.trim_start().starts_with("<environment_context>")
-}
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    if normalized.chars().count() <= max_chars {
-        return normalized;
-    }
 
-    format!(
-        "{}...",
-        normalized.chars().take(max_chars).collect::<String>()
-    )
-}
 
 fn non_empty_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
@@ -20526,21 +19015,9 @@ fn session_active_day(session: &ThreadSession) -> Option<String> {
         })
 }
 
-fn system_time_to_unix_string(value: SystemTime) -> String {
-    value
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
 
-fn ensure_parent_dir(path: &std::path::Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("创建目录失败：{}，路径：{}", error, parent.display()))?;
-    }
 
-    Ok(())
-}
+
 
 fn load_app_settings() -> Result<AppSettings, String> {
     ensure_app_settings_file()?;
@@ -20612,31 +19089,9 @@ fn normalize_app_activation_time(value: &str) -> Option<String> {
         .or_else(|| Some(trimmed.to_string()))
 }
 
-fn format_beijing_timestamp(now: OffsetDateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+08:00",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
-    )
-}
 
-fn is_plain_beijing_timestamp(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 19
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[10] == b' '
-        && bytes[13] == b':'
-        && bytes[16] == b':'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
-}
+
+
 
 fn normalize_system_version(version: String) -> String {
     let trimmed = version.trim().trim_start_matches('v').to_string();
@@ -21823,27 +20278,7 @@ fn router_full_debug_sse_line_value(line: &str) -> serde_json::Value {
     }
 }
 
-fn redact_sensitive_text(text: &str) -> String {
-    let mut result = Vec::new();
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("authorization:")
-            || lower.contains("cookie:")
-            || lower.contains("api-key:")
-            || lower.contains("apikey:")
-            || lower.contains("x-api-key:")
-        {
-            let prefix = line
-                .split_once(':')
-                .map(|(prefix, _)| prefix)
-                .unwrap_or(line);
-            result.push(format!("{}: <redacted>", prefix));
-        } else {
-            result.push(line.to_string());
-        }
-    }
-    result.join("\n")
-}
+
 
 fn limit_router_debug_body(body: &str) -> String {
     if body.len() <= ROUTER_DEBUG_BODY_LIMIT {
@@ -21895,7 +20330,52 @@ fn append_router_log_entry_sync(log_entry: &RouterLogEntry) -> Result<(), String
             error,
             path.display()
         )
-    })
+    })?;
+
+    if let Err(error) = insert_audit_log(
+        &log_entry.time,
+        &log_entry.source_ip,
+        &log_entry.method,
+        &log_entry.path,
+        &log_entry.status,
+        &log_entry.target_provider,
+        &log_entry.cost,
+        log_entry.input_tokens,
+        log_entry.output_tokens,
+        log_entry.cached_input_tokens,
+        log_entry.total_tokens,
+        &log_entry.usage_source,
+        &log_entry.error_detail,
+    ) {
+        eprintln!("audit log write error: {}", error);
+    }
+
+    Ok(())
+}
+
+fn append_account_usage_router_log(
+    url: &str,
+    account_id: &str,
+    status: &str,
+    error_detail: Option<&str>,
+) {
+    push_router_log(RouterLogEntry {
+        time: current_log_time(),
+        source_ip: "127.0.0.1".to_string(),
+        method: "GET".to_string(),
+        path: url.to_string(),
+        status: status.to_string(),
+        target_provider: "official".to_string(),
+        cost: EMPTY_LOG_VALUE.to_string(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        total_tokens: 0,
+        usage_source: "account_usage".to_string(),
+        error_detail: error_detail
+            .map(|value| format!("account={}, error={}", mask_secret(account_id), value))
+            .unwrap_or_else(|| format!("account={}", mask_secret(account_id))),
+    });
 }
 
 fn read_router_log_entries(limit: usize) -> Result<Vec<RouterLogEntry>, String> {
@@ -22525,52 +21005,11 @@ fn parse_provider_model_ids(body: &str) -> Result<Vec<String>, String> {
     Ok(models)
 }
 
-fn format_latency(latency_ms: u128) -> String {
-    if latency_ms >= 1000 {
-        format!("{:.1}s", latency_ms as f64 / 1000.0)
-    } else {
-        format!("{}ms", latency_ms)
-    }
-}
 
-fn json_response(
-    status_code: u16,
-    body: String,
-    target_provider: impl Into<String>,
-    error_detail: impl Into<String>,
-) -> RouterResponse {
-    RouterResponse {
-        flush_headers_before_body: false,
-        status_code,
-        content_type: HEADER_JSON.to_string(),
-        body,
-        target_provider: target_provider.into(),
-        error_detail: error_detail.into(),
-        usage: None,
-        usage_source: TOKEN_USAGE_SOURCE_MISSING.to_string(),
-    }
-}
 
-fn html_response(
-    status_code: u16,
-    body: String,
-    target_provider: impl Into<String>,
-    error_detail: impl Into<String>,
-) -> RouterResponse {
-    RouterResponse {
-        flush_headers_before_body: false,
-        status_code,
-        content_type: "text/html; charset=utf-8".to_string(),
-        body: format!(
-            "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>Codex OAuth</title><style>body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:48px;color:#0f172a}}p{{color:#475569}}</style></head><body>{}</body></html>",
-            body
-        ),
-        target_provider: target_provider.into(),
-        error_detail: error_detail.into(),
-        usage: None,
-        usage_source: TOKEN_USAGE_SOURCE_MISSING.to_string(),
-    }
-}
+
+
+
 
 fn write_http_response(
     stream: &mut TcpStream,
@@ -22615,127 +21054,27 @@ fn write_streaming_response_headers(
     stream.flush()
 }
 
-fn build_status_line(status_code: u16) -> String {
-    let reason = match status_code {
-        HTTP_OK => "OK",
-        HTTP_NO_CONTENT => "No Content",
-        HTTP_BAD_REQUEST => "Bad Request",
-        HTTP_UNAUTHORIZED => "Unauthorized",
-        HTTP_FORBIDDEN => "Forbidden",
-        HTTP_NOT_FOUND => "Not Found",
-        HTTP_METHOD_NOT_ALLOWED => "Method Not Allowed",
-        HTTP_PAYLOAD_TOO_LARGE => "Payload Too Large",
-        HTTP_TOO_MANY_REQUESTS => "Too Many Requests",
-        HTTP_BAD_GATEWAY => "Bad Gateway",
-        HTTP_SERVICE_UNAVAILABLE => "Service Unavailable",
-        _ => "Upstream Response",
-    };
 
-    format!("HTTP/1.1 {} {}", status_code, reason)
-}
 
-fn json_string(value: &str) -> String {
-    serde_json::Value::String(value.to_string()).to_string()
-}
 
-fn parse_request_line(request_line: &str) -> (String, String) {
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("UNKNOWN").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
 
-    (method, path)
-}
 
-fn request_path_without_query(path: &str) -> &str {
-    path.split_once('?')
-        .map(|(clean_path, _)| clean_path)
-        .unwrap_or(path)
-}
 
-fn oauth_redirect_uri() -> String {
-    let callback_port = CODEX_OAUTH_CALLBACK_LISTENER_PORT
-        .get()
-        .copied()
-        .unwrap_or_else(configured_oauth_callback_port);
-    format!("http://localhost:{}{}", callback_port, OAUTH_CALLBACK_PATH)
-}
 
-fn random_base64_url(byte_count: usize) -> Result<String, String> {
-    let mut bytes = vec![0u8; byte_count];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|error| format!("生成 OAuth 随机数失败：{}", error))?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
 
-fn parse_query_params(query: &str) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        params.insert(url_decode_component(key), url_decode_component(value));
-    }
-    params
-}
 
-fn url_encode_component(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(*byte as char)
-            }
-            b' ' => encoded.push('+'),
-            _ => encoded.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    encoded
-}
 
-fn url_decode_component(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = &value[index + 1..index + 3];
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    decoded.push(byte);
-                    index += 3;
-                } else {
-                    decoded.push(bytes[index]);
-                    index += 1;
-                }
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).to_string()
-}
 
-fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-}
 
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
+
+
+
+
+
+
+
+
+
 
 fn push_router_log(log_entry: RouterLogEntry) {
     let _ = append_router_log_entry(&log_entry);
@@ -22745,25 +21084,11 @@ fn push_router_log(log_entry: RouterLogEntry) {
     }
 }
 
-fn current_log_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
-}
 
-fn current_log_time() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
 
-fn current_auth_refresh_time() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| current_log_time())
-}
+
+
+
 
 fn build_health_response(started_at: Instant, router_port: u16) -> String {
     format!(
