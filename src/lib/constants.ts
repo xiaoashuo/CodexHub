@@ -1,4 +1,4 @@
-export const APP_VERSION = '0.1.4';
+export const APP_VERSION = '0.1.5';
 export const ROUTER_HOST = '127.0.0.1';
 export const ROUTER_PORT = 25817;
 export const ROUTER_BASE_PATH = '/v1';
