@@ -6,7 +6,7 @@ import { Button } from '../ui/Button';
 const INPUT_BASE =
   'w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-800 placeholder-slate-400 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100';
 import type { ModelConfig } from '../../types';
-import type { ModelDialogFormValues, ModelDialogState } from '../../lib/appTypes';
+import type { ModelDialogFormValues, ModelDialogState, ModelHeaderPair } from '../../lib/appTypes';
 import { invokeFetchProviderModels } from '../../lib/tauriBridge';
 
 const DEFAULT_BASE_URL = 'https://api.example.com/v1';
@@ -20,6 +20,24 @@ const PROTOCOL_OPTIONS = [
   { value: 'anthropic', label: 'anthropic', endpoint: '/messages' },
   { value: 'other', label: '其他', endpoint: '/chat/completions' },
 ];
+
+const headersRecordToPairs = (headers?: Record<string, string>): ModelHeaderPair[] => {
+  if (!headers) return [];
+  return Object.entries(headers)
+    .filter(([key]) => key.trim() !== '')
+    .map(([key, value]) => ({ key, value }));
+};
+
+const headersPairsToRecord = (pairs: ModelHeaderPair[]): Record<string, string> => {
+  const record: Record<string, string> = {};
+  for (const pair of pairs) {
+    const key = pair.key.trim();
+    if (key !== '') {
+      record[key] = pair.value;
+    }
+  }
+  return record;
+};
 
 export function ModelDialog({
   state,
@@ -47,6 +65,7 @@ export function ModelDialog({
     protocolType: model?.protocolType ?? DEFAULT_PROTOCOL_TYPE,
     endpointPath: model?.endpointPath ?? resolveDefaultEndpointPath(model?.protocolType ?? DEFAULT_PROTOCOL_TYPE),
     modelMappings: model?.modelMappings.join(', ') ?? '',
+    customHeaders: headersRecordToPairs(model?.customHeaders),
     priority: String(model?.priority ?? 0),
     weight: String(model?.weight ?? 1),
     enabled: model?.enabled ?? true,
@@ -72,6 +91,29 @@ export function ModelDialog({
       ...currentValues,
       protocolType,
       endpointPath: resolveDefaultEndpointPath(protocolType),
+    }));
+  };
+
+  const handleCustomHeaderChange = (index: number, field: 'key' | 'value', value: string) => {
+    setFormValues((currentValues) => ({
+      ...currentValues,
+      customHeaders: currentValues.customHeaders.map((pair, pairIndex) =>
+        pairIndex === index ? { ...pair, [field]: value } : pair,
+      ),
+    }));
+  };
+
+  const handleAddCustomHeader = () => {
+    setFormValues((currentValues) => ({
+      ...currentValues,
+      customHeaders: [...currentValues.customHeaders, { key: '', value: '' }],
+    }));
+  };
+
+  const handleRemoveCustomHeader = (index: number) => {
+    setFormValues((currentValues) => ({
+      ...currentValues,
+      customHeaders: currentValues.customHeaders.filter((_, pairIndex) => pairIndex !== index),
     }));
   };
 
@@ -120,6 +162,7 @@ export function ModelDialog({
       protocolType: formValues.protocolType,
       endpointPath: formValues.endpointPath,
       modelMappings: parseModelMappings(formValues.modelMappings),
+      customHeaders: headersPairsToRecord(formValues.customHeaders),
       priority: parseInteger(formValues.priority, 0),
       weight: Math.max(1, parseInteger(formValues.weight, 1)),
       enabled: formValues.enabled,
@@ -222,6 +265,47 @@ export function ModelDialog({
               onProviderModelSelect={(value) => value && handleFormValueChange('realModel', value)}
               onChatTest={handleChatTest}
             />
+            <Field label="自定义请求头" className="sm:col-span-2">
+              <div className="space-y-2">
+                {formValues.customHeaders.length === 0 && (
+                  <p className="text-xs text-slate-400">未配置自定义请求头，将只发送协议默认请求头。</p>
+                )}
+                {formValues.customHeaders.map((pair, pairIndex) => (
+                  <div key={pairIndex} className="flex items-center gap-2">
+                    <input
+                      className={`${INPUT_BASE} font-mono`}
+                      value={pair.key}
+                      placeholder="Header-Name"
+                      onChange={(event) => handleCustomHeaderChange(pairIndex, 'key', event.target.value)}
+                    />
+                    <input
+                      className={INPUT_BASE}
+                      value={pair.value}
+                      placeholder="value"
+                      onChange={(event) => handleCustomHeaderChange(pairIndex, 'value', event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-2 text-slate-400 transition hover:border-rose-200 hover:text-rose-600"
+                      onClick={() => handleRemoveCustomHeader(pairIndex)}
+                      title="删除请求头"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-dashed border-slate-300 px-3.5 py-2 text-sm font-medium text-slate-600 transition hover:border-indigo-300 hover:text-indigo-600"
+                  onClick={handleAddCustomHeader}
+                >
+                  添加请求头
+                </button>
+              </div>
+              <p className="mt-1.5 text-xs text-slate-400">
+                自定义请求头会附加到发往上游 Provider 的请求中，可用于传递私有网关所需的鉴权或路由标识。
+              </p>
+            </Field>
           </FormSection>
 
           <FormSection icon={Gauge} title="运行参数" description="上下文窗口与保守使用比例。">

@@ -315,6 +315,8 @@ pub fn write_app_settings(settings: AppSettingsInput) -> Result<AppSettings, Str
         router_default_model: settings.router_default_model.trim().to_string(),
         router_mode: normalize_router_mode(&settings.router_mode),
         router_auto_restart: settings.router_auto_restart,
+        audit_request_enabled: settings.audit_request_enabled,
+        audit_response_enabled: settings.audit_response_enabled,
     };
     save_app_settings(&normalized)?;
     read_app_settings()

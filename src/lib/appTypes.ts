@@ -2,6 +2,11 @@ import type { AppOperationLogEntry, AppSettings, CatalogModelOption, FilePreview
 
 export type ModelDialogMode = 'create' | 'edit';
 
+export type ModelHeaderPair = {
+  key: string;
+  value: string;
+};
+
 export type ModelDialogFormValues = {
   displayName: string;
   slug: string;
@@ -15,6 +20,7 @@ export type ModelDialogFormValues = {
   protocolType: string;
   endpointPath: string;
   modelMappings: string;
+  customHeaders: ModelHeaderPair[];
   priority: string;
   weight: string;
   enabled: boolean;

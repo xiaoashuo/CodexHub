@@ -5,6 +5,7 @@ pub mod json;
 pub mod url;
 pub mod http;
 pub mod sqlite;
+pub mod httpgpt;
 
 pub use file::*;
 pub use time::*;
@@ -13,3 +14,4 @@ pub use json::*;
 pub use url::*;
 pub use http::*;
 pub use sqlite::*;
+pub use httpgpt::*;

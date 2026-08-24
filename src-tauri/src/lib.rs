@@ -28,6 +28,7 @@ mod router_config;
 use constants::*;
 use provider_protocol::ProviderProtocol;
 use router_dispatcher::DispatchCandidate;
+use utils::httpgpt;
 use utils::sqlite::insert_audit_log;
 
 mod accounts;
@@ -446,7 +447,25 @@ struct RouterLogEntry {
     total_tokens: u64,
     #[serde(default)]
     usage_source: String,
+    #[serde(default)]
+    request_body: String,
+    #[serde(default)]
+    response_body: String,
     error_detail: String,
+}
+
+fn capture_log_body(input: &str) -> String {
+    const MAX_LOG_BODY_CHARS: usize = 256 * 1024;
+    if input.chars().count() <= MAX_LOG_BODY_CHARS {
+        input.to_string()
+    } else {
+        let truncated: String = input.chars().take(MAX_LOG_BODY_CHARS).collect();
+        format!("{}...[truncated]", truncated)
+    }
+}
+
+fn capture_log_request_body(bytes: &[u8]) -> String {
+    capture_log_body(&String::from_utf8_lossy(bytes))
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -669,6 +688,10 @@ struct AppSettings {
     router_mode: String,
     #[serde(default)]
     router_auto_restart: bool,
+    #[serde(default = "default_audit_request_enabled")]
+    audit_request_enabled: bool,
+    #[serde(default = "default_audit_response_enabled")]
+    audit_response_enabled: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -714,6 +737,10 @@ struct AppSettingsInput {
     router_mode: String,
     #[serde(default)]
     router_auto_restart: bool,
+    #[serde(default)]
+    audit_request_enabled: bool,
+    #[serde(default)]
+    audit_response_enabled: bool,
 }
 
 fn default_restart_target() -> String {
@@ -753,6 +780,8 @@ impl Default for AppSettings {
             router_default_model: String::new(),
             router_mode: default_router_mode(),
             router_auto_restart: false,
+            audit_request_enabled: default_audit_request_enabled(),
+            audit_response_enabled: default_audit_response_enabled(),
         }
     }
 }
@@ -767,6 +796,14 @@ fn default_router_auth_method() -> String {
 
 fn default_router_mode() -> String {
     "system".to_string()
+}
+
+fn default_audit_request_enabled() -> bool {
+    true
+}
+
+fn default_audit_response_enabled() -> bool {
+    true
 }
 
 fn normalize_router_mode(value: &str) -> String {
@@ -907,6 +944,8 @@ pub struct CodexAccountKeyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CodexAccountExpirationRequest {
     account_key: String,
+    #[serde(default)]
+    account_email: Option<String>,
     expires_at: Option<String>,
 }
 
@@ -1035,6 +1074,8 @@ struct ProviderConfigItemInput {
     protocol_type: String,
     #[serde(rename = "endpointPath", default)]
     endpoint_path: String,
+    #[serde(rename = "customHeaders", default)]
+    custom_headers: HashMap<String, String>,
     #[serde(rename = "modelMappings", alias = "modelAliases", default)]
     model_mappings: Vec<String>,
     #[serde(default)]
@@ -1195,6 +1236,8 @@ struct ProviderRouteFileItem {
     protocol_type: String,
     #[serde(rename = "endpointPath", default)]
     endpoint_path: String,
+    #[serde(rename = "customHeaders", default)]
+    custom_headers: HashMap<String, String>,
     #[serde(rename = "modelMappings", alias = "modelAliases", default)]
     model_mappings: Vec<String>,
     #[serde(default)]
@@ -1228,6 +1271,7 @@ impl From<ProviderConfigItemInput> for ProviderRouteFileItem {
             proxy_url: normalize_proxy_url(&value.proxy_url).unwrap_or_default(),
             protocol_type: normalize_protocol_type(&value.protocol_type),
             endpoint_path: normalize_endpoint_path(&value.endpoint_path),
+            custom_headers: value.custom_headers,
             model_mappings: normalize_model_mappings(&value.model_mappings),
             priority: value.priority,
             weight: normalize_provider_weight(value.weight),
@@ -1311,8 +1355,8 @@ struct CodexAuthCredentials {
     account_id: String,
 }
 
-struct OfficialCodexForwardSettings {
-    proxy_url: Option<String>,
+pub(crate) struct OfficialCodexForwardSettings {
+    pub(crate) proxy_url: Option<String>,
 }
 
 
@@ -1442,7 +1486,7 @@ fn wake_router_listener(router_port: u16) {
 
 
 
-fn append_internal_app_log(
+pub(crate) fn append_internal_app_log(
     level: &str,
     module: &str,
     action: &str,
@@ -3037,7 +3081,9 @@ fn refresh_codex_account_usage_blocking(
         });
     }
 
-    Err("额度刷新异常，详细信息请查看应用日志".to_string())
+    let detail = take_account_usage_last_error()
+        .unwrap_or_else(|| "未返回有效额度数据，详细信息请查看应用日志".to_string());
+    Err(format!("额度刷新异常：{}", detail))
 }
 
 
@@ -4838,6 +4884,12 @@ fn handle_connection(
         return streamed_result;
     }
 
+    if let Some(streamed_result) =
+        try_passthrough_unmatched_request(&request, &mut stream, &source_ip, request_started_at)
+    {
+        return streamed_result;
+    }
+
     let response = route_request(&request, started_at, router_port);
     let status_line = build_status_line(codex_sse_transport_status_code(
         response.status_code,
@@ -4858,21 +4910,18 @@ fn handle_connection(
         )?;
     }
 
-    Ok(RouterLogEntry {
-        time: current_log_time(),
-        source_ip,
-        method: request.method,
-        path: request.path,
-        status: response.status_code.to_string(),
-        target_provider: response.target_provider,
-        cost: format!("{}ms", request_started_at.elapsed().as_millis()),
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        total_tokens: usage.total_tokens,
-        usage_source: response.usage_source,
-        error_detail: response.error_detail,
-    })
+    Ok(build_router_log_entry(
+        &request,
+        &source_ip,
+        request_started_at,
+        response.status_code,
+        response.target_provider,
+        usage,
+        response.usage_source,
+        capture_log_request_body(&request.body),
+        capture_log_body(&response.body),
+        response.error_detail,
+    ))
 }
 
 fn try_stream_custom_responses_request(
@@ -4934,6 +4983,7 @@ fn stream_custom_responses_request(
     route: ProviderRoute,
 ) -> std::io::Result<RouterLogEntry> {
     let active_exec_cell_ids = collect_active_exec_cell_ids(&payload);
+    let mut captured_response_body = EMPTY_LOG_VALUE.to_string();
     guard_wait_tool_for_upstream(&mut payload);
     let protocol_type = normalize_protocol_type(&route.protocol_type);
     let use_codex_chat_tool_bridge =
@@ -5033,6 +5083,7 @@ fn stream_custom_responses_request(
                 .contains(HEADER_EVENT_STREAM)
             {
                 let body = response.into_string().unwrap_or_default();
+                captured_response_body = capture_log_body(&body);
                 append_router_full_debug_log(
                     "custom_streaming_upstream_response",
                     serde_json::json!({
@@ -5084,21 +5135,18 @@ fn stream_custom_responses_request(
                         response.body.as_bytes(),
                     )?;
                     status_code = response.status_code;
-                    return Ok(RouterLogEntry {
-                        time: current_log_time(),
-                        source_ip: source_ip.to_string(),
-                        method: request.method.clone(),
-                        path: request.path.clone(),
-                        status: status_code.to_string(),
-                        target_provider: route.provider,
-                        cost: format!("{}ms", request_started_at.elapsed().as_millis()),
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cached_input_tokens: usage.cached_input_tokens,
-                        total_tokens: usage.total_tokens,
+                    return Ok(build_router_log_entry(
+                        request,
+                        source_ip,
+                        request_started_at,
+                        status_code,
+                        route.provider,
+                        usage,
                         usage_source,
+                        capture_log_request_body(&request.body),
+                        capture_log_body(&response.body),
                         error_detail,
-                    });
+                    ));
                 }
                 if upstream_empty_text {
                     let (error_code, error_message) =
@@ -5135,21 +5183,18 @@ fn stream_custom_responses_request(
                         response.body.as_bytes(),
                     )?;
                     status_code = response.status_code;
-                    return Ok(RouterLogEntry {
-                        time: current_log_time(),
-                        source_ip: source_ip.to_string(),
-                        method: request.method.clone(),
-                        path: request.path.clone(),
-                        status: status_code.to_string(),
-                        target_provider: route.provider,
-                        cost: format!("{}ms", request_started_at.elapsed().as_millis()),
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cached_input_tokens: usage.cached_input_tokens,
-                        total_tokens: usage.total_tokens,
+                    return Ok(build_router_log_entry(
+                        request,
+                        source_ip,
+                        request_started_at,
+                        status_code,
+                        route.provider,
+                        usage,
                         usage_source,
+                        capture_log_request_body(&request.body),
+                        capture_log_body(&response.body),
                         error_detail,
-                    });
+                    ));
                 }
                 let body = if effective_protocol_type == "cpamc" {
                     ensure_responses_stream_completed(
@@ -5204,14 +5249,15 @@ fn stream_custom_responses_request(
                     &build_status_line(status_code),
                     HEADER_EVENT_STREAM,
                 )?;
-                if let Err(error) = stream_raw_upstream_sse(
+                match stream_raw_upstream_sse(
                     response,
                     stream,
                     Some(&full_debug_id),
                     &available_tool_names,
                     &active_exec_cell_ids,
                 ) {
-                    error_detail = format!("upstream stream disconnected: {}", error);
+                    Ok(body) => captured_response_body = capture_log_body(&body),
+                    Err(error) => error_detail = format!("upstream stream disconnected: {}", error),
                 }
             } else {
                 append_router_full_debug_log(
@@ -5233,7 +5279,7 @@ fn stream_custom_responses_request(
                 let available_tool_names = collect_available_tool_names(&payload);
                 let custom_tool_names = collect_custom_tool_names(&payload);
                 let namespace_tool_mappings = collect_namespace_tool_mappings(&payload);
-                if let Err(error) = stream_openai_chat_sse_as_codex(
+                match stream_openai_chat_sse_as_codex(
                     response,
                     stream,
                     &effective_route,
@@ -5243,7 +5289,8 @@ fn stream_custom_responses_request(
                     &namespace_tool_mappings,
                     Some(&full_debug_id),
                 ) {
-                    error_detail = format!("upstream stream disconnected: {}", error);
+                    Ok(body) => captured_response_body = capture_log_body(&body),
+                    Err(error) => error_detail = format!("upstream stream disconnected: {}", error),
                 }
             }
         }
@@ -5339,21 +5386,18 @@ fn stream_custom_responses_request(
         }
     }
 
-    Ok(RouterLogEntry {
-        time: current_log_time(),
-        source_ip: source_ip.to_string(),
-        method: request.method.clone(),
-        path: request.path.clone(),
-        status: status_code.to_string(),
-        target_provider: route.provider,
-        cost: format!("{}ms", request_started_at.elapsed().as_millis()),
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        total_tokens: usage.total_tokens,
+    Ok(build_router_log_entry(
+        request,
+        source_ip,
+        request_started_at,
+        status_code,
+        route.provider,
+        usage,
         usage_source,
+        capture_log_request_body(&request.body),
+        captured_response_body,
         error_detail,
-    })
+    ))
 }
 
 fn try_stream_official_responses_request(
@@ -5400,6 +5444,7 @@ fn stream_official_responses_request(
     let mut error_detail = EMPTY_LOG_VALUE.to_string();
     let mut usage = TokenUsage::default();
     let mut usage_source = TOKEN_USAGE_SOURCE_MISSING.to_string();
+    let mut captured_response_body = EMPTY_LOG_VALUE.to_string();
 
     let credentials = match load_codex_auth_credentials() {
         Ok(credentials) => credentials,
@@ -5426,6 +5471,8 @@ fn stream_official_responses_request(
                 OFFICIAL_TARGET_PROVIDER.to_string(),
                 usage,
                 usage_source,
+                capture_log_request_body(&request.body),
+                capture_log_body(&response.body),
                 error_detail,
             ));
         }
@@ -5458,6 +5505,8 @@ fn stream_official_responses_request(
                 OFFICIAL_TARGET_PROVIDER.to_string(),
                 usage,
                 usage_source,
+                capture_log_request_body(&request.body),
+                capture_log_body(&response.body),
                 error_detail,
             ));
         }
@@ -5509,9 +5558,10 @@ fn stream_official_responses_request(
                     }),
                 );
                 match stream_official_codex_sse(response, stream, Some(&full_debug_id)) {
-                    Ok(response_usage) => {
+                    Ok((response_usage, body)) => {
                         usage = response_usage.clone().unwrap_or_default();
                         usage_source = token_usage_source(response_usage.as_ref());
+                        captured_response_body = capture_log_body(&body);
                     }
                     Err(error) => {
                         error_detail = format!("official upstream stream disconnected: {}", error);
@@ -5530,6 +5580,7 @@ fn stream_official_responses_request(
                     }),
                 );
                 let body = ensure_official_sse_completed(body);
+                captured_response_body = capture_log_body(&body);
                 append_router_full_debug_log(
                     "official_router_response",
                     serde_json::json!({
@@ -5565,6 +5616,7 @@ fn stream_official_responses_request(
                 }),
             );
             let body = ensure_official_sse_completed(body);
+            captured_response_body = capture_log_body(&body);
             let response_usage = extract_token_usage_from_body(&body);
             usage = response_usage.clone().unwrap_or_default();
             usage_source = token_usage_source(response_usage.as_ref());
@@ -5604,6 +5656,8 @@ fn stream_official_responses_request(
         OFFICIAL_TARGET_PROVIDER.to_string(),
         usage,
         usage_source,
+        capture_log_request_body(&request.body),
+        captured_response_body,
         error_detail,
     ))
 }
@@ -5616,8 +5670,15 @@ fn build_router_log_entry(
     target_provider: String,
     usage: TokenUsage,
     usage_source: String,
+    request_body: String,
+    response_body: String,
     error_detail: String,
 ) -> RouterLogEntry {
+    let audit = load_app_settings()
+        .map(|settings| (settings.audit_request_enabled, settings.audit_response_enabled))
+        .unwrap_or((true, true));
+    let request_body = if audit.0 { request_body } else { String::new() };
+    let response_body = if audit.1 { response_body } else { String::new() };
     let error_detail = if (200..300).contains(&status_code) {
         EMPTY_LOG_VALUE.to_string()
     } else {
@@ -5637,6 +5698,8 @@ fn build_router_log_entry(
         cached_input_tokens: usage.cached_input_tokens,
         total_tokens: usage.total_tokens,
         usage_source,
+        request_body,
+        response_body,
         error_detail,
     }
 }
@@ -5688,6 +5751,180 @@ fn read_http_request(stream: &TcpStream) -> std::io::Result<ParsedRequest> {
         headers,
         body,
     })
+}
+
+fn is_router_managed_path(clean_path: &str) -> bool {
+    clean_path == HEALTH_PATH
+        || clean_path == RESPONSES_PATH
+        || clean_path == CHAT_COMPLETIONS_PATH
+        || is_account_proxy_path(clean_path)
+}
+
+fn send_transparent_passthrough_request(
+    method: &str,
+    url: &str,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    proxy_url: Option<&str>,
+) -> Result<(u16, String, String), ureq::Error> {
+    let agent = upstream_agent(proxy_url);
+    let method_upper = method.to_uppercase();
+    let mut request = match method_upper.as_str() {
+        "GET" => agent.get(url),
+        "POST" => agent.post(url),
+        "PUT" => agent.put(url),
+        "DELETE" => agent.delete(url),
+        "PATCH" => agent.patch(url),
+        "HEAD" => agent.head(url),
+        "OPTIONS" => agent.request("OPTIONS", url),
+        _ => agent.get(url),
+    };
+    request = request.timeout(std::time::Duration::from_secs(120));
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if lower == "host"
+            || lower == "content-length"
+            || lower == "accept-encoding"
+            || lower == "content-encoding"
+            || lower == "connection"
+            || lower == "transfer-encoding"
+        {
+            continue;
+        }
+        request = request.set(name, value);
+    }
+
+    let response = if method_upper == "GET" || method_upper == "HEAD" || method_upper == "DELETE" {
+        request.call()?
+    } else {
+        request.send_bytes(body)?
+    };
+    let status = response.status();
+    let content_type = response.content_type().to_string();
+    let body_string = response.into_string().unwrap_or_default();
+    Ok((status, content_type, body_string))
+}
+
+fn try_passthrough_unmatched_request(
+    request: &ParsedRequest,
+    stream: &mut TcpStream,
+    source_ip: &str,
+    request_started_at: Instant,
+) -> Option<std::io::Result<RouterLogEntry>> {
+    let clean_path = request_path_without_query(&request.path);
+    if is_router_managed_path(&clean_path) {
+        return None;
+    }
+
+    let method = request.method.to_uppercase();
+    let upstream_url = format!("https://chatgpt.com{}", request.path);
+    let proxy_url = load_app_settings()
+        .ok()
+        .and_then(|settings| {
+            let url = settings.official_proxy_url.trim();
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            }
+        });
+
+    let supported_method = matches!(
+        method.as_str(),
+        "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS"
+    );
+
+    let account_auth = if clean_path.starts_with("/backend-api/") {
+        httpgpt::active_account_codex_auth()
+    } else {
+        None
+    };
+
+    if account_auth.is_none() && !supported_method {
+        return None;
+    }
+
+    let send_result: Result<(u16, String, String), ureq::Error> = if let Some((access_token, account_id)) =
+        account_auth
+    {
+        httpgpt::send_authenticated_chatgpt_backend_request(
+            &method,
+            &upstream_url,
+            &request.body,
+            &access_token,
+            &account_id,
+            proxy_url.as_deref(),
+        )
+    } else {
+        send_transparent_passthrough_request(
+            &method,
+            &upstream_url,
+            &request.body,
+            &request.headers,
+            proxy_url.as_deref(),
+        )
+    };
+
+    let empty_usage = TokenUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 0,
+    };
+
+    let (status_code, content_type, body, error_detail) = match send_result {
+        Ok((status, content_type, body)) => (status, content_type, body, EMPTY_LOG_VALUE.to_string()),
+        Err(ureq::Error::Status(status, response)) => {
+            let content_type = response.content_type().to_string();
+            let body = response.into_string().unwrap_or_default();
+            (status, content_type, body, format!("upstream status {}", status))
+        }
+        Err(error) => {
+            let message = format!("upstream forward failed: {}", error);
+            let status_line = build_status_line(codex_sse_transport_status_code(
+                HTTP_BAD_GATEWAY,
+                "application/json",
+            ));
+            if let Err(write_error) = write_http_response(
+                stream,
+                &status_line,
+                "application/json",
+                b"{\"error\":\"upstream_forward_failed\"}",
+            ) {
+                return Some(Err(write_error));
+            }
+            return Some(Ok(build_router_log_entry(
+                request,
+                source_ip,
+                request_started_at,
+                HTTP_BAD_GATEWAY,
+                "passthrough".to_string(),
+                empty_usage,
+                EMPTY_LOG_VALUE.to_string(),
+                capture_log_request_body(&request.body),
+                capture_log_body("{\"error\":\"upstream_forward_failed\"}"),
+                message,
+            )));
+        }
+    };
+
+    let status_line = build_status_line(codex_sse_transport_status_code(status_code, &content_type));
+    if let Err(write_error) = write_http_response(stream, &status_line, &content_type, body.as_bytes()) {
+        return Some(Err(write_error));
+    }
+    Some(Ok(build_router_log_entry(
+        request,
+        source_ip,
+        request_started_at,
+        status_code,
+        "passthrough".to_string(),
+        empty_usage,
+        EMPTY_LOG_VALUE.to_string(),
+        capture_log_request_body(&request.body),
+        capture_log_body(&body),
+        error_detail,
+    )))
 }
 
 fn route_request(request: &ParsedRequest, started_at: Instant, router_port: u16) -> RouterResponse {
@@ -10818,7 +11055,7 @@ fn send_official_codex_request_with_retries(
     Err(last_error.expect("official retry loop should store the last upstream error"))
 }
 
-fn load_official_codex_forward_settings() -> OfficialCodexForwardSettings {
+pub(crate) fn load_official_codex_forward_settings() -> OfficialCodexForwardSettings {
     let settings_proxy_url = load_app_settings()
         .ok()
         .map(|settings| settings.official_proxy_url)
@@ -11770,10 +12007,11 @@ fn stream_raw_upstream_sse(
     full_debug_id: Option<&str>,
     available_tool_names: &[String],
     active_exec_cell_ids: &[String],
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     let mut reader = BufReader::new(response.into_reader());
     let mut saw_completed = false;
     let mut saw_done = false;
+    let mut captured_body = String::new();
     let mut pending_event_line: Option<String> = None;
     let mut suppressed_wait_item_ids = HashSet::<String>::new();
     let mut pending_wait_item_id: Option<String> = None;
@@ -11784,6 +12022,7 @@ fn stream_raw_upstream_sse(
             Ok(bytes_read) => bytes_read,
             Err(error) => {
                 if saw_completed {
+                    captured_body.push_str("\n\ndata: [DONE]\n\n");
                     stream.write_all(b"\n\ndata: [DONE]\n\n")?;
                     stream.flush()?;
                 } else {
@@ -11861,6 +12100,7 @@ fn stream_raw_upstream_sse(
 
             if let Some(is_valid) = wait_resolution {
                 if is_valid {
+                    captured_body.push_str(&pending_wait_sse);
                     stream.write_all(pending_wait_sse.as_bytes())?;
                     stream.flush()?;
                 } else {
@@ -11881,8 +12121,10 @@ fn stream_raw_upstream_sse(
                             &mut suppressed_wait_item_ids,
                         ) {
                             if let Some(event_line) = current_event_line {
+                                captured_body.push_str(&event_line);
                                 stream.write_all(event_line.as_bytes())?;
                             }
+                            captured_body.push_str(&completed);
                             stream.write_all(completed.as_bytes())?;
                             stream.flush()?;
                         }
@@ -11937,8 +12179,10 @@ fn stream_raw_upstream_sse(
             }),
         );
         if let Some(event_line) = event_line {
+            captured_body.push_str(&event_line);
             stream.write_all(event_line.as_bytes())?;
         }
+        captured_body.push_str(&line);
         stream.write_all(line.as_bytes())?;
         stream.flush()?;
     }
@@ -11968,19 +12212,20 @@ fn stream_raw_upstream_sse(
         stream.write_all(b"\n\ndata: [DONE]\n\n")?;
     }
     stream.flush()?;
-    Ok(())
+    Ok(captured_body)
 }
 
 fn stream_official_codex_sse(
     response: ureq::Response,
     stream: &mut TcpStream,
     full_debug_id: Option<&str>,
-) -> std::io::Result<Option<TokenUsage>> {
+) -> std::io::Result<(Option<TokenUsage>, String)> {
     let mut reader = BufReader::new(response.into_reader());
     let mut saw_completed = false;
     let mut saw_done = false;
     let mut usage_buffer = String::new();
     let mut usage = None;
+    let mut captured_body = String::new();
 
     loop {
         let mut line = String::new();
@@ -11988,6 +12233,7 @@ fn stream_official_codex_sse(
             Ok(bytes_read) => bytes_read,
             Err(error) => {
                 if saw_completed {
+                    captured_body.push_str("\n\ndata: [DONE]\n\n");
                     stream.write_all(b"\n\ndata: [DONE]\n\n")?;
                     stream.flush()?;
                 } else {
@@ -12037,6 +12283,7 @@ fn stream_official_codex_sse(
                 "line": router_full_debug_sse_line_value(&line)
             }),
         );
+        captured_body.push_str(&line);
         stream.write_all(line.as_bytes())?;
         stream.flush()?;
     }
@@ -12068,7 +12315,7 @@ fn stream_official_codex_sse(
     }
     stream.flush()?;
 
-    Ok(usage.or_else(|| extract_token_usage_from_body(&usage_buffer)))
+    Ok((usage.or_else(|| extract_token_usage_from_body(&usage_buffer)), captured_body))
 }
 
 fn merge_openai_stream_tool_calls(
@@ -12223,10 +12470,11 @@ fn stream_openai_chat_sse_as_codex(
     custom_tool_names: &[String],
     namespace_tool_mappings: &[NamespaceToolMapping],
     full_debug_id: Option<&str>,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     let mut reader = BufReader::new(response.into_reader());
     let mut state = new_codex_text_stream_state(&route.real_model);
     let mut saw_done = false;
+    let mut captured_body = String::new();
     let mut event_samples = Vec::new();
     let mut stream_started = false;
     let mut buffered_text = String::new();
@@ -12256,6 +12504,7 @@ fn stream_openai_chat_sse_as_codex(
         if bytes_read == 0 {
             break;
         }
+        captured_body.push_str(&line);
         let line = line.trim_end_matches(&['\r', '\n'][..]).trim_start();
         let Some(data) = line.strip_prefix("data:") else {
             append_router_full_debug_log(
@@ -12364,7 +12613,8 @@ fn stream_openai_chat_sse_as_codex(
             namespace_tool_mappings,
         ) {
             stream.write_all(tool_sse.as_bytes())?;
-            return stream.flush();
+            stream.flush()?;
+            return Ok(captured_body);
         }
     }
 
@@ -12437,7 +12687,7 @@ fn stream_openai_chat_sse_as_codex(
                 "tool_call_count": 0
             }),
         );
-        write_codex_text_stream_done(stream, &state)
+        write_codex_text_stream_done(stream, &state)?
     } else {
         append_router_full_debug_log(
             "openai_chat_router_response_completed",
@@ -12449,8 +12699,9 @@ fn stream_openai_chat_sse_as_codex(
                 "tool_call_count": tool_items.len()
             }),
         );
-        write_codex_text_stream_done_with_items(stream, &state, tool_items)
+        write_codex_text_stream_done_with_items(stream, &state, tool_items)?
     }
+    Ok(captured_body)
 }
 
 fn extract_openai_chat_stream_text_delta(root: &serde_json::Value) -> Option<String> {
@@ -12467,7 +12718,7 @@ fn extract_openai_chat_stream_text_delta(root: &serde_json::Value) -> Option<Str
         .map(content_to_text)
 }
 
-fn find_codex_account_id(root: &serde_json::Value) -> Option<String> {
+pub(crate) fn find_codex_account_id(root: &serde_json::Value) -> Option<String> {
     find_string_by_keys(root, CODEX_ACCOUNT_ID_KEYS).or_else(|| find_first_account_id(root))
 }
 
@@ -17947,7 +18198,7 @@ fn collect_accounts_from_registry(
     }
 }
 
-fn find_registry_account(
+pub(crate) fn find_registry_account(
     registry: &serde_json::Value,
     account_key: &str,
 ) -> Option<serde_json::Value> {
@@ -18308,40 +18559,12 @@ fn sync_official_catalog_blocking() -> Result<Vec<CatalogModelOption>, String> {
     let access_token = access_token.ok_or_else(|| "未找到当前账号的访问令牌".to_string())?;
     let account_id = account_id.ok_or_else(|| "未找到当前账号的 ChatGPT-Account-Id".to_string())?;
     let settings = load_official_codex_forward_settings();
-    let request = match settings.proxy_url.as_deref().and_then(|url| ureq::Proxy::new(url).ok()) {
-        Some(proxy) => ureq::builder().proxy(proxy).build().get(OFFICIAL_CODEX_MODELS_URL),
-        None => ureq::get(OFFICIAL_CODEX_MODELS_URL),
-    }
-        .timeout(Duration::from_secs(ACCOUNT_USAGE_REQUEST_TIMEOUT_SECONDS))
-        .set(HEADER_AUTHORIZATION, &format!("Bearer {}", access_token))
-        .set(HEADER_CHATGPT_ACCOUNT_ID, &account_id)
-        .set("Host", "chatgpt.com")
-        .set(HEADER_ACCEPT, HEADER_JSON);
-    let response = request.call().map_err(|error| {
-        append_account_usage_router_log(
-            OFFICIAL_CODEX_MODELS_URL,
-            &account_id,
-            "error",
-            Some(&error.to_string()),
-        );
-        format!("同步官方模型失败：{}", error)
-    })?;
-    if !(200..300).contains(&response.status()) {
-        append_account_usage_router_log(
-            OFFICIAL_CODEX_MODELS_URL,
-            &account_id,
-            &response.status().to_string(),
-            None,
-        );
-        return Err(format!("同步官方模型失败，HTTP 状态码：{}", response.status()));
-    }
-    append_account_usage_router_log(
+    let body = httpgpt::fetch_codex_models(
         OFFICIAL_CODEX_MODELS_URL,
+        &access_token,
         &account_id,
-        &response.status().to_string(),
-        None,
-    );
-    let body = response.into_string().map_err(|error| format!("读取官方模型响应失败：{}", error))?;
+        settings.proxy_url.as_deref(),
+    )?;
     let root = serde_json::from_str::<serde_json::Value>(&body).map_err(|error| format!("解析官方模型响应失败：{}", error))?;
     if root.get(CATALOG_MODELS_KEY).and_then(|value| value.as_array()).is_none() {
         return Err("官方模型响应缺少 models 数组".to_string());
@@ -18359,16 +18582,31 @@ fn fetch_codex_usage_from_url(
 ) -> Option<CodexUsageSnapshot> {
     let settings = load_official_codex_forward_settings();
     let authorization = format!("Bearer {}", access_token);
-    let body = send_codex_usage_request(url, &authorization, account_id, &settings, manual, collect_error)?;
+    let body = httpgpt::send_codex_usage_request(
+        url,
+        &authorization,
+        account_id,
+        &settings,
+        manual,
+        collect_error,
+    )?;
     let root = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(root) => root,
         Err(error) => {
             *collect_error = Some(format!(
-                "url={}, account={}, error={}",
+                "url={}, account={}, error={}, body={}",
                 url,
                 mask_secret(account_id),
-                error
+                error,
+                truncate_text(&body, 600)
             ));
+            append_account_usage_router_log(
+                url,
+                account_id,
+                "parse_error",
+                Some(&error.to_string()),
+                Some(&body),
+            );
             if should_log_verbose_account_usage_refresh(manual) {
                 append_internal_app_log(
                     "warn",
@@ -18395,6 +18633,13 @@ fn fetch_codex_usage_from_url(
             mask_secret(account_id),
             truncate_text(&body, 200)
         ));
+        append_account_usage_router_log(
+            url,
+            account_id,
+            "invalid_usage",
+            Some("响应中未找到有效额度窗口"),
+            Some(&body),
+        );
         if should_log_verbose_account_usage_refresh(manual) {
             append_internal_app_log(
                 "warn",
@@ -18413,146 +18658,7 @@ fn fetch_codex_usage_from_url(
     usage
 }
 
-fn send_codex_usage_request(
-    url: &str,
-    authorization: &str,
-    account_id: &str,
-    settings: &OfficialCodexForwardSettings,
-    manual: bool,
-    collect_error: &mut Option<String>,
-) -> Option<String> {
-    let agent = match settings.proxy_url.as_deref() {
-        Some(proxy_url) => match ureq::Proxy::new(proxy_url) {
-            Ok(proxy) => Some(ureq::builder().proxy(proxy).build()),
-            Err(_) => None,
-        },
-        None => None,
-    };
-    let request = match agent.as_ref() {
-        Some(agent) => agent.get(url),
-        None => ureq::get(url),
-    }
-    .timeout(Duration::from_secs(ACCOUNT_USAGE_REQUEST_TIMEOUT_SECONDS))
-    .set(HEADER_ACCEPT, HEADER_JSON)
-    .set(HEADER_CONTENT_TYPE, HEADER_JSON)
-    .set(HEADER_AUTHORIZATION, authorization)
-    .set(HEADER_CHATGPT_ACCOUNT_ID, account_id)
-    .set("Host", "chatgpt.com")
-    .set(HEADER_OPENAI_BETA, OFFICIAL_CODEX_BETA_HEADER_VALUE)
-    .set(HEADER_ORIGINATOR, OFFICIAL_CODEX_ORIGINATOR)
-    .set(HEADER_ORIGIN, "https://chatgpt.com")
-    .set(HEADER_REFERER, "https://chatgpt.com/")
-    .set(HEADER_USER_AGENT, "Mozilla/5.0 codex-router-shell");
-
-    if should_log_verbose_account_usage_refresh(manual) {
-        append_internal_app_log(
-            "info",
-            "accounts",
-            "refresh-usage",
-            "发送额度刷新请求",
-            Some(format!(
-                "method=GET, url={}, account={}",
-                url,
-                mask_secret(account_id)
-            )),
-        );
-    }
-
-    let response = request.call();
-
-    let response = match response {
-        Ok(response) => {
-            append_account_usage_router_log(
-                url,
-                account_id,
-                &response.status().to_string(),
-                None,
-            );
-            if should_log_verbose_account_usage_refresh(manual) {
-                append_internal_app_log(
-                    "info",
-                    "accounts",
-                    "refresh-usage",
-                    "额度刷新请求返回",
-                    Some(format!(
-                        "method=GET, url={}, account={}, status={}",
-                        url,
-                        mask_secret(account_id),
-                        response.status()
-                    )),
-                );
-            }
-            let status = response.status();
-            if !(200..300).contains(&status) {
-                *collect_error = Some(format!(
-                    "method=GET, url={}, account={}, status={}",
-                    url,
-                    mask_secret(account_id),
-                    status
-                ));
-                if should_log_verbose_account_usage_refresh(manual) {
-                    append_internal_app_log(
-                        "warn",
-                        "accounts",
-                        "refresh-usage",
-                        "额度接口返回非成功状态",
-                        Some(format!(
-                            "method=GET, url={}, account={}, status={}",
-                            url,
-                            mask_secret(account_id),
-                            status
-                        )),
-                    );
-                }
-                return None;
-            }
-            response
-        }
-        Err(error) => {
-            append_account_usage_router_log(url, account_id, "error", Some(&error.to_string()));
-            *collect_error = Some(format!(
-                "method=GET, url={}, account={}, error={}",
-                url,
-                mask_secret(account_id),
-                error
-            ));
-            if should_log_verbose_account_usage_refresh(manual) {
-                append_internal_app_log(
-                    "warn",
-                    "accounts",
-                    "refresh-usage",
-                    "请求额度接口失败",
-                    Some(format!(
-                        "method=GET, url={}, account={}, error={}",
-                        url,
-                        mask_secret(account_id),
-                        error
-                    )),
-                );
-            }
-            return None;
-        }
-    };
-
-    let body = response.into_string().ok()?;
-    if should_log_verbose_account_usage_refresh(manual) {
-        append_internal_app_log(
-            "info",
-            "accounts",
-            "refresh-usage",
-            "额度刷新响应内容",
-            Some(format!(
-                "method=GET, url={}, account={}, body={}",
-                url,
-                mask_secret(account_id),
-                truncate_text(&body, 1200)
-            )),
-        );
-    }
-    Some(body)
-}
-
-fn should_log_verbose_account_usage_refresh(manual: bool) -> bool {
+pub(crate) fn should_log_verbose_account_usage_refresh(manual: bool) -> bool {
     manual && ACCOUNT_USAGE_VERBOSE_APP_LOGS
 }
 
@@ -18597,6 +18703,32 @@ fn usage_snapshot_from_backend_value(
         });
 
     if primary.is_none() && secondary.is_none() {
+        // 兜底：官方接口可能使用非 primary/secondary 键名（如 5h/7d 或自定义键）。
+        // 扫描 rate_limits / 根对象下所有具备额度窗口结构的对象，按窗口时长挑选最短两个。
+        let mut windows: Vec<CodexUsageWindow> = Vec::new();
+        collect_usage_windows(rate_limits, &mut windows);
+        windows.sort_by_key(|window| window.limit_window_seconds.unwrap_or(u64::MAX));
+        let fallback_primary = windows.first().cloned();
+        let fallback_secondary = windows.get(1).cloned().or_else(|| windows.first().cloned());
+        if fallback_primary.is_some() {
+            return Some(CodexUsageSnapshot {
+                primary: fallback_primary,
+                secondary: fallback_secondary,
+                plan: find_string_by_keys(
+                    root,
+                    &[
+                        "plan_type",
+                        "planType",
+                        "chatgpt_plan_type",
+                        "chatgptPlanType",
+                        "plan",
+                    ],
+                ),
+                user_id: find_codex_user_id(root),
+                account_id: find_codex_account_id(root),
+            });
+        }
+
         if has_explicit_usage_windows && should_log_verbose_account_usage_refresh(manual) {
             append_internal_app_log(
                 "warn",
@@ -18681,6 +18813,25 @@ fn find_rate_limits_value(value: &serde_json::Value) -> Option<&serde_json::Valu
         }
         serde_json::Value::Array(items) => items.iter().find_map(find_rate_limits_value),
         _ => None,
+    }
+}
+
+fn collect_usage_windows(value: &serde_json::Value, out: &mut Vec<CodexUsageWindow>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(window) = usage_window_from_value(value) {
+                out.push(window);
+            }
+            for child in map.values() {
+                collect_usage_windows(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_usage_windows(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -18956,7 +19107,7 @@ fn backup_current_auth_file() -> Result<(), String> {
 
 
 
-fn find_codex_access_token(root: &serde_json::Value) -> Option<String> {
+pub(crate) fn find_codex_access_token(root: &serde_json::Value) -> Option<String> {
     find_string_by_keys(root, CODEX_ACCESS_TOKEN_KEYS)
 }
 
@@ -20353,12 +20504,16 @@ fn append_router_log_entry_sync(log_entry: &RouterLogEntry) -> Result<(), String
     Ok(())
 }
 
-fn append_account_usage_router_log(
+pub(crate) fn append_account_usage_router_log(
     url: &str,
     account_id: &str,
     status: &str,
     error_detail: Option<&str>,
+    response_body: Option<&str>,
 ) {
+    let audit_response_enabled = load_app_settings()
+        .map(|settings| settings.audit_response_enabled)
+        .unwrap_or(true);
     push_router_log(RouterLogEntry {
         time: current_log_time(),
         source_ip: "127.0.0.1".to_string(),
@@ -20372,6 +20527,14 @@ fn append_account_usage_router_log(
         cached_input_tokens: 0,
         total_tokens: 0,
         usage_source: "account_usage".to_string(),
+        request_body: EMPTY_LOG_VALUE.to_string(),
+        response_body: if audit_response_enabled {
+            response_body
+                .map(capture_log_body)
+                .unwrap_or_else(|| EMPTY_LOG_VALUE.to_string())
+        } else {
+            EMPTY_LOG_VALUE.to_string()
+        },
         error_detail: error_detail
             .map(|value| format!("account={}, error={}", mask_secret(account_id), value))
             .unwrap_or_else(|| format!("account={}", mask_secret(account_id))),

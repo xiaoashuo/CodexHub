@@ -131,7 +131,20 @@ function DashboardStatCard({ icon, value, label, helper }: { icon: React.ReactNo
 }
 
 function formatTokenCount(value: number) {
-  return new Intl.NumberFormat('zh-CN').format(value || 0);
+  const v = value || 0;
+  if (v >= 1000000) {
+    return `${trimTrailingZero(v / 1000000)}M`;
+  }
+  if (v >= 10000) {
+    return `${trimTrailingZero(v / 1000)}k`;
+  }
+  return new Intl.NumberFormat('zh-CN').format(v);
+}
+
+function trimTrailingZero(n: number) {
+  return n
+    .toFixed(1)
+    .replace(/\.0$/, '');
 }
 
 function formatBytes(bytes: number) {

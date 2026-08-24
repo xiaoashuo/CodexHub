@@ -87,14 +87,6 @@ function PathSettings({
           onAction={() => setProxyDialogOpen(true)}
         />
         <SettingsListRow title="核心文件" description="当前工作目录、配置、Catalog、日志等路径。" actionLabel="查看" onAction={() => setCoreFilesOpen(true)} />
-        <SettingsToggleRow
-          title="调试模式"
-          description=""
-          enabled={appSettings.router_debug_mode || false}
-          onToggle={async (enabled) => {
-            await handleAppSettingsSave({ ...appSettings, router_debug_mode: enabled });
-          }}
-        />
         <TokenAutoRenewRow enabled={appSettings.token_auto_renew_enabled || false} onToggle={async (enabled: boolean) => { await invokeToggleCodexTokenAutoRenew(enabled); await handleAppSettingsSave({ ...appSettings, token_auto_renew_enabled: enabled }); }} />
         <SettingsListRow title="当前版本" value={normalizeDisplayVersion(appSettings.system_version)} valueVariant="plain" valuePlacement="right" />
       </div>
@@ -116,7 +108,7 @@ export function SettingsPage(props: {
   handleAppSettingsSave: (settings: AppSettings) => Promise<void>;
   handleCodexRestart: () => Promise<{ success: boolean; message: string }>;
 }) {
-  const [activeTab, setActiveTab] = useState<'system' | 'maintenance'>('system');
+  const [activeTab, setActiveTab] = useState<'system' | 'maintenance' | 'audit'>('system');
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
@@ -125,14 +117,54 @@ export function SettingsPage(props: {
           <h2 className="text-2xl font-bold leading-tight text-slate-950">设置</h2>
         <div className="flex gap-1 rounded-2xl bg-slate-100 p-1">
           <button type="button" onClick={() => setActiveTab('system')} className={`rounded-xl px-5 py-2.5 text-sm font-semibold transition ${activeTab === 'system' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>系统设置</button>
+          <button type="button" onClick={() => setActiveTab('audit')} className={`rounded-xl px-5 py-2.5 text-sm font-semibold transition ${activeTab === 'audit' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>审计配置</button>
           <button type="button" onClick={() => setActiveTab('maintenance')} className={`rounded-xl px-5 py-2.5 text-sm font-semibold transition ${activeTab === 'maintenance' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>维护工具</button>
         </div>
         </div>
-        <p className="mt-1.5 text-sm text-slate-500">管理 Codex 启动、代理、配置路径与应用维护选项。</p>
+        <p className="mt-1.5 text-sm text-slate-500">管理 Codex 启动、代理、审计与应用维护选项。</p>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
-        {activeTab === 'system' ? <SystemSettingsPage {...props} /> : <MaintenanceToolsPage appSettings={props.appSettings} handleAppSettingsSave={props.handleAppSettingsSave} />}
+        {activeTab === 'system' ? <SystemSettingsPage {...props} /> : activeTab === 'audit' ? <AuditSettingsPage {...props} /> : <MaintenanceToolsPage appSettings={props.appSettings} handleAppSettingsSave={props.handleAppSettingsSave} />}
       </div>
+    </div>
+  );
+}
+
+function AuditSettingsPage({
+  appSettings,
+  handleAppSettingsSave,
+}: {
+  appSettings: AppSettings;
+  handleAppSettingsSave: (settings: AppSettings) => Promise<void>;
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <CardHeader className="shrink-0 py-4">
+          <h3 className="text-lg font-bold text-slate-950">审计配置</h3>
+        </CardHeader>
+        <CardContent className="min-h-0 flex-1 overflow-hidden pt-4">
+          <div className="min-h-0 overflow-y-auto rounded-xl border border-slate-200 bg-white">
+            <SettingsToggleRow
+              title="审计请求体"
+              description="开启后，路由日志会记录转发到上游模型的完整请求体。"
+              enabled={appSettings.audit_request_enabled ?? true}
+              onToggle={async (enabled) => {
+                await handleAppSettingsSave({ ...appSettings, audit_request_enabled: enabled });
+              }}
+            />
+            <SettingsToggleRow
+              title="审计响应体"
+              description="开启后，路由日志会记录上游模型返回的完整响应体。"
+              enabled={appSettings.audit_response_enabled ?? true}
+              onToggle={async (enabled) => {
+                await handleAppSettingsSave({ ...appSettings, audit_response_enabled: enabled });
+              }}
+            />
+            <SettingsListRow title="说明" description="关闭对应开关后，新的路由日志将不再记录该部分内容；已记录的日志不受影响。" valueVariant="plain" />
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -459,8 +491,6 @@ function buildConfigPathItems(localConfigPaths: LocalConfigPaths) {
     { label: 'Catalog JSON', value: localConfigPaths.catalog_path },
     { label: 'Router provider config', value: localConfigPaths.provider_config_path },
     { label: 'App settings JSON', value: localConfigPaths.app_settings_path },
-    { label: 'App operation log', value: localConfigPaths.app_log_path },
-    { label: 'Router debug log', value: localConfigPaths.router_debug_log_path },
   ];
 }
 

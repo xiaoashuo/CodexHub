@@ -441,6 +441,11 @@ export function App() {
 
   const handleModelDialogSave = async (values: ModelDialogFormValues) => {
     const parsedContextWindow = parseOptionalPositiveInteger(values.contextWindow);
+    const customHeaders = Object.fromEntries(
+      values.customHeaders
+        .map((pair) => [pair.key.trim(), pair.value] as const)
+        .filter(([key]) => key !== ''),
+    );
     const nextModel: ModelConfig = {
       slug: values.slug || `model_${Date.now()}`,
       displayName: values.displayName,
@@ -456,6 +461,7 @@ export function App() {
       protocolType: values.protocolType,
       endpointPath: values.endpointPath,
       modelMappings: [...new Set(values.modelMappings.split(',').map((item) => item.trim()).filter(Boolean))],
+      customHeaders,
       priority: Number.isFinite(Number(values.priority)) ? Math.trunc(Number(values.priority)) : 0,
       weight: Math.max(1, Number.isFinite(Number(values.weight)) ? Math.trunc(Number(values.weight)) : 1),
       enabled: values.enabled,
@@ -885,7 +891,7 @@ function renderActivePage(activeNav: NavItem, context: PageContext): ReactElemen
     '\u6a21\u578b\u7ba1\u7406': <ModelsPage models={context.models} appSettings={context.appSettings} handlePreviewAction={context.handlePreviewAction} handleModelDialogOpen={context.handleModelDialogOpen} handleModelDelete={context.handleModelDelete} handleModelEnabledToggle={context.handleModelEnabledToggle} handleModelSetActive={context.handleModelSetActive} handleModelProxySave={context.handleModelProxySave} handleModelConnectivityTest={context.handleModelConnectivityTest} handleModelChatTest={context.handleModelChatTest} handleModelConfigExport={context.handleModelConfigExport} handleModelConfigImport={context.handleModelConfigImport} handleSyncModelsToCatalog={context.handleSyncModelsToCatalog} />,
     '\u4f1a\u8bdd\u7ba1\u7406': <ThreadManagerPage />,
      '\u8def\u7531\u7ba1\u7406': <RouterPage routerStatus={context.routerStatus} routerActionRunning={context.routerActionRunning} appSettings={context.appSettings} routerConfig={context.routerConfig} catalogModels={context.catalogModels} localConfigPaths={context.localConfigPaths} handleRouterToggle={context.handleRouterToggle} handleRouterRestart={context.handleRouterRestart} handleRouterHealthCheck={context.handleRouterHealthCheck} handleAppSettingsSave={context.handleAppSettingsSave} handleRouterConfigSave={context.handleRouterConfigSave} handleSyncModelsToCatalog={context.handleSyncModelsToCatalog} handleCodexRestart={context.handleCodexRestart} />,
-    '\u65e5\u5fd7': <LogsPage routerLogs={context.routerLogs} appOperationLogs={context.appOperationLogs} handleRouterLogsRefresh={context.handleRouterLogsRefresh} handleRouterLogsClear={context.handleRouterLogsClear} handleAppLogsSearch={context.handleAppLogsSearch} handleAppLogsClear={context.handleAppLogsClear} />,
+    '\u65e5\u5fd7': <LogsPage routerLogs={context.routerLogs} models={context.models} appOperationLogs={context.appOperationLogs} handleRouterLogsRefresh={context.handleRouterLogsRefresh} handleRouterLogsClear={context.handleRouterLogsClear} handleAppLogsSearch={context.handleAppLogsSearch} handleAppLogsClear={context.handleAppLogsClear} />,
     '\u670d\u52a1': <ServicesPage />,
     '\u8bbe\u7f6e': <SettingsPage appSettings={context.appSettings} localConfigPaths={context.localConfigPaths} filePreview={context.filePreview} handleLocalFilePreview={context.handleLocalFilePreview} handleLocalFilePreviewClose={context.handleLocalFilePreviewClose} handleAppSettingsSave={context.handleAppSettingsSave} handleCodexRestart={context.handleCodexRestart} />,
   };
@@ -929,6 +935,8 @@ function createDefaultAppSettings(): AppSettings {
     router_default_model: '',
     router_mode: 'system',
     router_auto_restart: false,
+    audit_request_enabled: true,
+    audit_response_enabled: true,
   };
 }
 
@@ -1062,6 +1070,7 @@ function buildProviderConfigFile(models: ModelConfig[]): ProviderConfigFile {
       protocolType: model.protocolType,
       endpointPath: model.endpointPath,
       modelMappings: model.modelMappings,
+      customHeaders: model.customHeaders,
       priority: model.priority,
       weight: model.weight,
       enabled: model.enabled,
@@ -1095,6 +1104,7 @@ function providerConfigToModels(config: ProviderConfigFile, currentModels: Model
       modelMappings: Array.isArray(item.modelMappings)
         ? item.modelMappings
         : Array.isArray(item.modelAliases) ? item.modelAliases : [],
+      customHeaders: item.customHeaders && typeof item.customHeaders === 'object' ? item.customHeaders : {},
       priority: typeof item.priority === 'number' ? item.priority : 0,
       weight: typeof item.weight === 'number' && item.weight > 0 ? item.weight : 1,
       enabled: item.enabled,

@@ -197,9 +197,27 @@ pub fn update_codex_account_expiration(
         .get_mut("items")
         .and_then(|value| value.as_array_mut())
         .ok_or_else(|| "账号注册表缺少 items。".to_string())?;
+    let requested_email = request
+        .account_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let item_index = items
+        .iter()
+        .position(|item| json_string_field(item, "accountKey").as_deref() == Some(&request.account_key))
+        .or_else(|| {
+            requested_email.as_deref().and_then(|email| {
+                items.iter().position(|item| {
+                    json_string_field(item, "email")
+                        .map(|value| value.trim().to_ascii_lowercase() == email)
+                        .unwrap_or(false)
+                })
+            })
+        })
+        .ok_or_else(|| "未找到要设置到期时间的账号。".to_string())?;
     let item = items
-        .iter_mut()
-        .find(|item| json_string_field(item, "accountKey").as_deref() == Some(&request.account_key))
+        .get_mut(item_index)
         .ok_or_else(|| "未找到要设置到期时间的账号。".to_string())?;
     let account = item
         .as_object_mut()

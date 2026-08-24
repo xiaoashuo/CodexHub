@@ -302,6 +302,9 @@ export interface RouterLogEntry {
   cached_input_tokens?: number;
   total_tokens?: number;
   usage_source?: string;
+  stream?: boolean;
+  request_body?: string;
+  response_body?: string;
   error_detail: string;
 }
 
@@ -372,6 +375,8 @@ export interface ProviderConfigItem {
   modelMappings?: string[];
   /** Backward-compatible input from configurations saved before the channel refactor. */
   modelAliases?: string[];
+  /** Custom HTTP request headers appended to upstream requests for this channel. */
+  customHeaders?: Record<string, string>;
   priority?: number;
   weight?: number;
   enabled: boolean;
@@ -457,6 +462,8 @@ export interface AppSettings {
   router_default_model: string;
   router_mode: 'system' | 'third';
   router_auto_restart: boolean;
+  audit_request_enabled: boolean;
+  audit_response_enabled: boolean;
 }
 
 export interface SyncCatalogResult {
@@ -596,6 +603,8 @@ export interface ModelConfig {
   endpointPath: string;
   /** Codex-visible model names served by this upstream channel. */
   modelMappings: string[];
+  /** Custom HTTP request headers appended to upstream requests for this channel. */
+  customHeaders: Record<string, string>;
   /** Higher priority tiers are used before lower priority tiers. */
   priority: number;
   /** Smooth weighted round-robin weight within the same priority tier. */

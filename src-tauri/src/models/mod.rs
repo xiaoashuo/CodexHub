@@ -52,6 +52,7 @@ pub fn read_provider_config() -> Result<ProviderConfigInput, String> {
                 proxy_url: normalize_proxy_url(&route.proxy_url).unwrap_or_default(),
                 protocol_type: normalize_protocol_type(&route.protocol_type),
                 endpoint_path: normalize_endpoint_path(&route.endpoint_path),
+                custom_headers: route.custom_headers.clone(),
                 model_mappings: normalize_model_mappings(&route.model_mappings),
                 priority: route.priority,
                 weight: normalize_provider_weight(route.weight),

@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
-import { Search, Trash2, RefreshCw, KeyRound, Server, Box, CalendarDays, ShieldCheck, ChevronRight, X } from 'lucide-react';
+import { Search, Trash2, RefreshCw, Server, Box, CalendarDays, ShieldCheck, ChevronRight, X, ArrowUp, ArrowDown } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
-import type { AppOperationLogEntry, RouterLogEntry } from '../../types';
+import type { AppOperationLogEntry, ModelConfig, RouterLogEntry } from '../../types';
 
 type LogsTab = 'router' | 'app';
 
@@ -11,7 +11,6 @@ interface AuditRow {
   id: string;
   displayNo: number;
   time: string;
-  keyName: string;
   upstream: string;
   model: string;
   status: string;
@@ -23,6 +22,7 @@ interface AuditRow {
 
 export function LogsPage({
   routerLogs,
+  models,
   appOperationLogs,
   handleRouterLogsRefresh,
   handleRouterLogsClear,
@@ -30,6 +30,7 @@ export function LogsPage({
   handleAppLogsClear,
 }: {
   routerLogs: RouterLogEntry[];
+  models: ModelConfig[];
   appOperationLogs: AppOperationLogEntry[];
   handleRouterLogsRefresh: () => Promise<void>;
   handleRouterLogsClear: () => Promise<void>;
@@ -87,7 +88,7 @@ export function LogsPage({
       </div>
 
       {tab === 'router' ? (
-        <RouterAuditLog logs={routerLogs} onRefresh={handleRouterLogsRefresh} onClear={handleRouterLogsClear} filterOpen={filterOpen} setFilterOpen={setFilterOpen} />
+        <RouterAuditLog logs={routerLogs} models={models} onRefresh={handleRouterLogsRefresh} onClear={handleRouterLogsClear} filterOpen={filterOpen} setFilterOpen={setFilterOpen} />
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto pb-2">
           <AppLogsPanel logs={appOperationLogs} handleAppLogsSearch={handleAppLogsSearch} handleAppLogsClear={handleAppLogsClear} filterOpen={filterOpen} setFilterOpen={setFilterOpen} />
@@ -154,19 +155,20 @@ function TabButton({ active, onClick, children }: { active: boolean; onClick: ()
 
 function RouterAuditLog({
   logs,
+  models,
   onRefresh,
   onClear,
   filterOpen,
   setFilterOpen,
 }: {
   logs: RouterLogEntry[];
+  models: ModelConfig[];
   onRefresh: () => Promise<void>;
   onClear: () => Promise<void>;
   filterOpen: boolean;
   setFilterOpen: (open: boolean | ((prev: boolean) => boolean)) => void;
 }) {
   const [keyword, setKeyword] = useState('');
-  const [keyName, setKeyName] = useState('');
   const [channel, setChannel] = useState('');
   const [model, setModel] = useState('');
   const [source, setSource] = useState('全部来源');
@@ -177,14 +179,23 @@ function RouterAuditLog({
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
 
+  const channelModelMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const item of models) {
+      if (item.slug) {
+        map[item.slug] = item.realModel || item.slug;
+      }
+    }
+    return map;
+  }, [models]);
+
   const rows = useMemo<AuditRow[]>(() => {
     const list = logs
       .map((log, index) => ({
         id: `${log.time}|${log.path}|${log.status}|${log.target_provider}|${index}`,
         time: formatLogTime(log.time),
-        keyName: '-',
         upstream: log.target_provider,
-        model: '-',
+        model: log.target_provider ? (channelModelMap[log.target_provider] ?? log.target_provider) : '-',
         status: log.status,
         secure: true,
         token: log.total_tokens ?? (log.input_tokens ?? 0) + (log.output_tokens ?? 0),
@@ -200,8 +211,7 @@ function RouterAuditLog({
 
     return list
       .filter((row) => {
-        if (kw && !`${row.time} ${row.raw.path} ${row.upstream} ${row.status}`.toLowerCase().includes(kw)) return false;
-        if (keyName.trim() && !row.keyName.includes(keyName.trim())) return false;
+        if (kw && !`${row.time} ${row.raw.path} ${row.upstream} ${row.model} ${row.status}`.toLowerCase().includes(kw)) return false;
         if (ch && !row.upstream.toLowerCase().includes(ch)) return false;
         if (model.trim() && !row.model.includes(model.trim())) return false;
         if (src && !row.upstream.toLowerCase().includes(src)) return false;
@@ -211,7 +221,7 @@ function RouterAuditLog({
         return true;
       })
       .map((row, index) => ({ ...row, displayNo: list.length - index }));
-  }, [logs, deletedIds, keyword, keyName, channel, model, source, traceId, startDate, endDate]);
+  }, [logs, deletedIds, keyword, channel, model, source, traceId, startDate, endDate, channelModelMap]);
 
   const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -227,7 +237,6 @@ function RouterAuditLog({
 
   const resetFilters = () => {
     setKeyword('');
-    setKeyName('');
     setChannel('');
     setModel('');
     setSource('全部来源');
@@ -250,8 +259,7 @@ function RouterAuditLog({
             </button>
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <FilterInput icon={<Search size={15} className="text-[#94a3b8]" />} value={keyword} onChange={setKeyword} placeholder="关键词搜索（密钥/渠道/模型/Trace）" />
-            <FilterInput icon={<KeyRound size={15} className="text-[#94a3b8]" />} value={keyName} onChange={setKeyName} placeholder="密钥名称" />
+            <FilterInput icon={<Search size={15} className="text-[#94a3b8]" />} value={keyword} onChange={setKeyword} placeholder="关键词搜索（渠道/模型/Trace）" />
             <FilterInput icon={<Server size={15} className="text-[#94a3b8]" />} value={channel} onChange={setChannel} placeholder="渠道名称" />
             <FilterInput icon={<Box size={15} className="text-[#94a3b8]" />} value={model} onChange={setModel} placeholder="模型名称" />
             <SelectInput icon={<Server size={15} className="text-[#94a3b8]" />} value={source} onChange={setSource} options={[{ label: '全部来源', value: '全部来源' }, { label: 'grok公益', value: 'grok公益' }, { label: '小米公益', value: '小米公益' }, { label: 'cmy', value: 'cmy' }, { label: 'local', value: 'local' }]} />
@@ -273,15 +281,14 @@ function RouterAuditLog({
                 <th className="w-10 px-3" />
                 <th className="px-3 py-3 font-semibold">#</th>
                 <th className="px-3 py-3 font-semibold">时间</th>
-                <th className="px-3 py-3 font-semibold">密钥</th>
                 <th className="px-3 py-3 font-semibold">上游</th>
                 <th className="px-3 py-3 font-semibold">模型</th>
                 <th className="px-3 py-3 font-semibold">状态</th>
-                <th className="px-3 py-3 font-semibold">安全</th>
+                <th className="whitespace-nowrap px-3 py-3 font-semibold">安全</th>
                 <th className="px-3 py-3 font-semibold">Token</th>
                 <th className="px-3 py-3 font-semibold">耗时</th>
                 <th className="px-3 py-3 font-semibold">
-                  <span className="inline-flex items-center gap-1"><ChevronRight size={13} />更多</span>
+                  <span className="inline-flex items-center gap-1 whitespace-nowrap"><ChevronRight size={13} />更多</span>
                 </th>
                 <th className="w-12 px-3" />
               </tr>
@@ -340,7 +347,6 @@ function RowFragment({ row, expanded, onToggle, onDelete }: { row: AuditRow; exp
         </td>
         <td className="px-3 font-mono text-[#94a3b8]">#{row.displayNo}</td>
         <td className="px-3 whitespace-nowrap">{row.time}</td>
-        <td className="px-3 whitespace-nowrap">{row.keyName}</td>
         <td className="px-3">
           <div className="flex flex-col gap-1">
             <span className="whitespace-nowrap">{row.upstream}</span>
@@ -353,7 +359,7 @@ function RowFragment({ row, expanded, onToggle, onDelete }: { row: AuditRow; exp
         <td className={`px-3 font-mono tabular-nums ${row.token === 0 ? 'text-[#94a3b8]' : 'text-[#334155]'}`}>{row.token}</td>
         <td className="px-3 font-mono whitespace-nowrap text-[#64748b]">{row.duration}</td>
         <td className="px-3">
-          <button type="button" className="inline-flex items-center gap-1 text-[#94a3b8] transition hover:text-[#0f172a]" onClick={onToggle}>
+          <button type="button" className="inline-flex items-center gap-1 whitespace-nowrap text-[#94a3b8] transition hover:text-[#0f172a]" onClick={onToggle}>
             <ChevronRight size={13} />
             更多
           </button>
@@ -376,30 +382,314 @@ function RowFragment({ row, expanded, onToggle, onDelete }: { row: AuditRow; exp
 }
 
 function AuditDetail({ row }: { row: AuditRow }) {
+  return <RouterLogDetail row={row} />;
+}
+
+type LogDetailTab = 'request' | 'response';
+
+function RouterLogDetail({ row }: { row: AuditRow }) {
+  const [tab, setTab] = useState<LogDetailTab>('request');
+  const [showRaw, setShowRaw] = useState(false);
   const raw = row.raw;
-  const items: [string, ReactNode][] = [
-    ['Trace ID', '-'],
-    ['请求 URL', raw.path],
-    ['HTTP Method', raw.method],
-    ['请求时间', row.time],
-    ['响应时间', `${row.time} (${row.duration})`],
-    ['Prompt Tokens', String(raw.input_tokens ?? 0)],
-    ['Completion Tokens', String(raw.output_tokens ?? 0)],
-    ['Total Tokens', String(row.token)],
-    ['请求参数', '-'],
-    ['响应结果', '-'],
-    ['错误信息', raw.status.startsWith('2') ? '-' : (raw.error_detail || '-')],
-  ];
+  const input = raw.input_tokens ?? 0;
+  const output = raw.output_tokens ?? 0;
+  const cached = raw.cached_input_tokens ?? 0;
+  const total = row.token;
+  const isStream = raw.stream ?? false;
+
+  const requestBody = raw.request_body ?? '';
+  const responseBody = raw.response_body ?? '';
+
+  const requestBytes = byteLength(requestBody);
+  const requestChars = [...requestBody].length;
+  const cost = (input * 1.25 + output * 10 + cached * 0.125) / 1_000_000;
+
   return (
-    <div className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
-      {items.map(([label, value]) => (
-        <div key={label} className="min-w-0">
-          <div className="text-xs font-medium text-[#94a3b8]">{label}</div>
-          <div className="mt-1 break-all text-sm text-[#334155]">{value}</div>
+    <div className="flex flex-col gap-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="rounded-2xl border border-[#eef2f7] bg-white px-4 py-3">
+          <div className="text-xs font-medium text-[#94a3b8]">Token 消耗</div>
+          <div className="mt-1 text-2xl font-bold text-[#0f172a]">{formatTokenAmount(total)}</div>
+          <div className="mt-1 text-xs text-[#64748b]">
+            输入 {formatTokenAmount(input)} <span className="px-1 text-[#cbd5e1]">|</span> 输出 {formatTokenAmount(output)}
+            {cached > 0 && (
+              <span className="text-[#94a3b8]"> <span className="px-1 text-[#cbd5e1]">|</span> 缓存 {formatTokenAmount(cached)}</span>
+            )}
+          </div>
         </div>
-      ))}
+
+        <div className="rounded-2xl border border-[#eef2f7] bg-white px-4 py-3">
+          <div className="text-xs font-medium text-[#94a3b8]">请求大小</div>
+          <div className="mt-1 text-2xl font-bold text-[#0f172a]">{formatSize(requestBytes)}</div>
+          <div className="mt-1 text-xs text-[#64748b]">{requestChars.toLocaleString('zh-CN')} 字符</div>
+        </div>
+
+        <div className="rounded-2xl border border-[#eef2f7] bg-white px-4 py-3">
+          <div className="text-xs font-medium text-[#94a3b8]">请求耗时</div>
+          <div className="mt-1 text-2xl font-bold text-[#0f172a]">{row.duration}</div>
+          <div className="mt-1 text-xs text-[#64748b]">{isStream ? '流式' : '非流式'}{raw.usage_source ? <span><span className="px-1 text-[#cbd5e1]">|</span>用量来源 {raw.usage_source}</span> : null}</div>
+        </div>
+
+        <div className="rounded-2xl border border-[#eef2f7] bg-white px-4 py-3">
+          <div className="text-xs font-medium text-[#94a3b8]">成本估算</div>
+          <div className="mt-1 text-2xl font-bold text-[#0f172a]">${cost.toFixed(4)}</div>
+          <div className="mt-1 text-xs text-[#64748b]">参考 GPT-5 定价</div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-x-8 gap-y-2 rounded-2xl border border-[#eef2f7] bg-white px-4 py-3 sm:grid-cols-2">
+        <DetailLine label="请求地址" value={raw.path} />
+        <DetailLine label="方法" value={raw.method} />
+        <DetailLine label="上游渠道" value={raw.target_provider} />
+        <DetailLine label="来源 IP" value={raw.source_ip} />
+      </div>
+
+      <div className="overflow-hidden rounded-2xl border border-[#eef2f7] bg-white">
+        <div className="flex flex-wrap items-center gap-1 border-b border-[#eef2f7] px-2 py-2">
+          <DetailTabButton active={tab === 'request'} onClick={() => setTab('request')}>
+            <ArrowUp size={13} /> 请求
+          </DetailTabButton>
+          <DetailTabButton active={tab === 'response'} onClick={() => setTab('response')}>
+            <ArrowDown size={13} /> 响应
+          </DetailTabButton>
+
+          {tab === 'request' && (
+            <button
+              type="button"
+              onClick={() => setShowRaw((current) => !current)}
+              className="ml-auto rounded-[11px] border border-[#e2e8f0] bg-white px-3 py-1.5 text-sm font-medium text-[#0f172a] transition hover:bg-slate-50"
+            >
+              {showRaw ? '收起原始 JSON' : '查看原始 JSON'}
+            </button>
+          )}
+        </div>
+
+        <div className="px-4 py-3">
+          {tab === 'request' && (
+            <div className="flex flex-col gap-3">
+              {showRaw ? <BodyBlock title="请求体" body={requestBody} /> : <RequestBodySummary body={requestBody} />}
+            </div>
+          )}
+
+          {tab === 'response' && (
+            <BodyBlock title="响应体" body={responseBody} />
+          )}
+        </div>
+      </div>
     </div>
   );
+}
+
+function RequestBodySummary({ body }: { body: string }) {
+  const summary = useMemo(() => {
+    const EMPTY_HINT = '-';
+    if (!body || body === EMPTY_HINT) {
+      return null;
+    }
+
+    const asStr = (value: unknown): string => (typeof value === 'string' ? value : '');
+    const asArr = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+    const countMatches = (source: string, re: RegExp): number => (source.match(re) || []).length;
+
+    const computeFromParsed = (parsed: Record<string, unknown>) => {
+      const model = asStr(parsed.model) || EMPTY_HINT;
+      const stream = parsed.stream === true ? '是' : parsed.stream === false ? '否' : EMPTY_HINT;
+      const maxOut = typeof parsed.max_output_tokens === 'number' ? String(parsed.max_output_tokens) : EMPTY_HINT;
+      const temperature = typeof parsed.temperature === 'number' ? String(parsed.temperature) : EMPTY_HINT;
+      const incremental = asStr(parsed.previous_response_id) ? '增量' : '全量';
+
+      const input = asArr(parsed.input);
+      const messageCount = input.filter((item) => {
+        const type = asStr((item as Record<string, unknown>)?.type);
+        return type !== 'function_call' && type !== 'function_call_output' && type !== 'custom_tool_call' && type !== 'custom_tool_call_output' && type !== 'item_reference';
+      }).length;
+      const hasToolCall = input.some((item) => {
+        const type = asStr((item as Record<string, unknown>)?.type);
+        return type === 'function_call' || type === 'custom_tool_call';
+      });
+
+      const instructions = asStr(parsed.instructions);
+      const tools = asArr(parsed.tools).map((tool) => {
+        const t = tool as Record<string, unknown>;
+        const type = asStr(t.type) || 'function';
+        const name = asStr(t.name) || asStr((t.function as Record<string, unknown>)?.name) || EMPTY_HINT;
+        return type === 'namespace' ? `namespace(${name})` : name;
+      });
+      const toolText = tools.length ? `${tools.length} 个 · ${tools.join(', ')}` : '无';
+
+      return { model, stream, maxOut, temperature, incremental, messageCount, hasToolCall, inputChars: [...body].length, instructions, toolText, partial: false };
+    };
+
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      parsed = null;
+    }
+    if (parsed && typeof parsed === 'object') {
+      return computeFromParsed(parsed);
+    }
+
+    const pick = (re: RegExp): string | null => {
+      const m = body.match(re);
+      return m ? (m[1] ?? null) : null;
+    };
+    const model = pick(/"model"\s*:\s*"([^"]*)"/) ?? EMPTY_HINT;
+    const streamRaw = pick(/"stream"\s*:\s*(true|false)/);
+    const stream = streamRaw === 'true' ? '是' : streamRaw === 'false' ? '否' : EMPTY_HINT;
+    const maxOut = pick(/"max_output_tokens"\s*:\s*(\d+)/) ?? EMPTY_HINT;
+    const temperature = pick(/"temperature"\s*:\s*([\d.]+)/) ?? EMPTY_HINT;
+    const incremental = pick(/"previous_response_id"\s*:\s*"([^"]*)"/) ? '增量' : '全量';
+    const messageCount = countMatches(body, /"type"\s*:\s*"message"/g) || 0;
+    const hasToolCall = /"type"\s*:\s*"(function_call|custom_tool_call)"/.test(body);
+    const instructions = /"instructions"\s*:\s*"/.test(body) ? '（存在）' : '无';
+    const toolDefs = countMatches(body, /"type"\s*:\s*"(function|custom|namespace)"/g);
+    const toolText = toolDefs ? `${toolDefs} 个（部分解析）` : '无';
+
+    return { model, stream, maxOut, temperature, incremental, messageCount, hasToolCall, inputChars: [...body].length, instructions, toolText, partial: true };
+  }, [body]);
+
+  if (!summary) {
+    return <div className="rounded-2xl border border-[#eef2f7] bg-white px-4 py-3 text-sm text-[#94a3b8]">无请求体</div>;
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <SummaryCard label="会话模式" value={summary.incremental} />
+        <SummaryCard label="消息轮数" value={String(summary.messageCount)} />
+        <SummaryCard label="工具调用" value={summary.hasToolCall ? '有' : '无'} />
+        <SummaryCard label="输入规模" value={`${summary.inputChars} 字符`} />
+      </div>
+
+      {summary.partial && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-700">
+          请求体被截断或非标准格式，以下为尽力解析的摘要；点「查看原始 JSON」可看完整内容。
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-x-8 gap-y-2 rounded-2xl border border-[#eef2f7] bg-white px-4 py-3 sm:grid-cols-2">
+        <DetailLine label="系统指令" value={summary.partial ? summary.instructions : summary.instructions ? `${summary.instructions.length} 字符` : '无'} />
+        <DetailLine label="工具" value={summary.toolText} />
+      </div>
+    </div>
+  );
+}
+
+function SummaryCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-2xl border border-[#eef2f7] bg-white px-4 py-3">
+      <div className="text-xs font-medium text-[#94a3b8]">{label}</div>
+      <div className="mt-1 truncate text-lg font-bold text-[#0f172a]" title={value}>{value}</div>
+    </div>
+  );
+}
+
+function BodyBlock({ title, body }: { title: string; body: string }) {
+  const [copied, setCopied] = useState(false);
+  if (!body) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-[#e2e8f0] bg-[#fafafa] py-8 text-center text-sm text-[#94a3b8]">
+        无{title}
+      </div>
+    );
+  }
+  let pretty = body;
+  try {
+    pretty = JSON.stringify(JSON.parse(body), null, 2);
+  } catch {
+    pretty = body;
+  }
+  const handleCopy = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(body);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = body;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <div className="min-w-0">
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-xs font-medium text-[#94a3b8]">{title}</span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="inline-flex items-center gap-1 rounded-[11px] border border-[#e2e8f0] bg-white px-2.5 py-1 text-xs font-medium text-[#0f172a] transition hover:bg-slate-50"
+        >
+          {copied ? '已复制' : '复制'}
+        </button>
+      </div>
+      <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-[#0f172a] px-4 py-3 text-xs leading-relaxed text-[#e2e8f0]">
+{pretty}
+      </pre>
+    </div>
+  );
+}
+
+function byteLength(value: string) {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(value).length;
+  }
+  return value.length;
+}
+
+function formatSize(bytes: number) {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
+}
+
+function DetailLine({ label, value, valueClass = '' }: { label: string; value: ReactNode; valueClass?: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-xs font-medium text-[#94a3b8]">{label}</div>
+      <div className={`mt-1 break-all text-sm text-[#334155] ${valueClass}`}>{value}</div>
+    </div>
+  );
+}
+
+function DetailTabButton({ active, onClick, children, className = '' }: { active: boolean; onClick: () => void; children: ReactNode; className?: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-sm font-medium transition ${
+        active ? 'bg-indigo-50 text-indigo-700' : 'text-[#64748b] hover:bg-slate-50 hover:text-[#0f172a]'
+      } ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function formatTokenAmount(value: number) {
+  const v = value || 0;
+  if (v >= 1000000) return `${trimTrailingZero(v / 1000000)}M`;
+  if (v >= 10000) return `${trimTrailingZero(v / 1000)}k`;
+  return new Intl.NumberFormat('zh-CN').format(v);
+}
+
+function trimTrailingZero(n: number) {
+  return n
+    .toFixed(1)
+    .replace(/\.0$/, '');
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -416,7 +706,7 @@ function StatusBadge({ status }: { status: string }) {
 
 function SecurityBadge() {
   return (
-    <span className="inline-flex h-[23px] items-center gap-1 rounded-full border border-[#a7f3d0] bg-[#ecfdf5] px-2.5 text-[12px] font-medium text-[#059669]">
+    <span className="inline-flex h-[23px] items-center gap-1 whitespace-nowrap rounded-full border border-[#a7f3d0] bg-[#ecfdf5] px-2.5 text-[12px] font-medium text-[#059669]">
       <ShieldCheck size={13} />
       安全
     </span>
